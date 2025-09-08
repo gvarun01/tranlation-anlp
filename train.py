@@ -148,6 +148,8 @@ def train_model(config):
 
     initial_epoch = 0
     global_step = 0
+    
+    # Check for existing checkpoints to resume from
     if config['preload']:
         model_filename = get_weights_path(config, config['preload'])
         print(f"Preloading model {model_filename}")
@@ -156,6 +158,29 @@ def train_model(config):
         initial_epoch = state['epoch'] + 1
         optimizer.load_state_dict(state['optimizer_state_dict'])
         global_step = state['global_step']
+    else:
+        # Auto-resume from latest checkpoint if available
+        base_path = Path('.')
+        gdrive_path = config.get('gdrive_path')
+        if gdrive_path:
+            base_path = Path(gdrive_path)
+        
+        model_folder = base_path / config['model_folder']
+        if model_folder.exists():
+            # Find the latest checkpoint
+            checkpoints = list(model_folder.glob(f"{config['model_basename']}*.pt"))
+            if checkpoints:
+                latest_checkpoint = max(checkpoints, key=lambda x: int(x.stem.split('_')[-1]))
+                print(f"Found existing checkpoint: {latest_checkpoint}")
+                print("Do you want to resume from this checkpoint? (y/n)")
+                response = input().strip().lower()
+                if response == 'y':
+                    state = torch.load(latest_checkpoint)
+                    model.load_state_dict(state['model_state_dict'])
+                    initial_epoch = state['epoch'] + 1
+                    optimizer.load_state_dict(state['optimizer_state_dict'])
+                    global_step = state['global_step']
+                    print(f"Resumed training from epoch {initial_epoch}")
 
     loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer_src.token_to_id('[PAD]'), label_smoothing=0.1).to(device)
 
@@ -185,8 +210,7 @@ def train_model(config):
 
             global_step += 1
         
-        run_evaluation(model, validation_dataloader, tokenizer_src, tokenizer_tgt, config['seq_len'], device, lambda msg: batch_iterator.write(msg), global_step, writer, "validation")
-
+        # Save model checkpoint
         model_filename = get_weights_path(config, f'{epoch:02d}')
         torch.save({
             "epoch": epoch,
