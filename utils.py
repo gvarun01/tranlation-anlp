@@ -4,7 +4,6 @@ import math
 from pathlib import Path
 from torch.utils.data import Dataset
 from tokenizers import Tokenizer
-from datasets import load_dataset
 
 # From config.py
 def get_config():
@@ -26,7 +25,8 @@ def get_config():
         "decoding_strategy": "greedy", # or "beam", "top-k"
         "beam_size": 5,
         "top_k": 3,
-        "gdrive_path": "/content/drive/MyDrive/translation_anlp/"
+        "gdrive_path": "/content/drive/MyDrive/translation_anlp/",
+        "warmup_steps": 4000
     }
 
 def get_weights_path(config, epoch: str):

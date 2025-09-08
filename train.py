@@ -7,6 +7,7 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 import warnings
 import torchmetrics
+from datasets import load_dataset
 
 from model import build_transformer
 from utils import (
@@ -201,8 +202,14 @@ def train_model(config):
             loss = loss_fn(proj_output.view(-1, tokenizer_tgt.get_vocab_size()), label.view(-1))
             batch_iterator.set_postfix({f"loss": f"{loss.item():6.3f}"})
 
-            writer.add_scalar('train loss', loss.item(), global_step)
-            writer.flush()
+            # Update learning rate
+            d_model = config['d_model']
+            warmup_steps = config['warmup_steps']
+            lr = (d_model ** -0.5) * min((global_step + 1) ** -0.5, (global_step + 1) * (warmup_steps ** -1.5))
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = lr
+            
+            writer.add_scalar('learning_rate', lr, global_step)
 
             loss.backward()
             optimizer.step()

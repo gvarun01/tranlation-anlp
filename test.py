@@ -5,7 +5,7 @@ from tokenizers import Tokenizer
 from model import build_transformer
 from utils import get_config, get_weights_path, greedy_decode, beam_search_decode, top_k_sampling_decode
 
-def translate(sentence: str):
+def translate(epoch_number: str, sentence: str):
     """
     Translates a sentence using greedy, beam search, and top-k sampling decoding strategies.
     """
@@ -13,17 +13,13 @@ def translate(sentence: str):
     print(f"Using device: {device}")
     config = get_config()
     
-    # Load tokenizers from the path specified in the config
-    base_path = Path('.')
-    gdrive_path = config.get('gdrive_path')
-    if gdrive_path and Path(gdrive_path).exists():
-        base_path = Path(gdrive_path)
-    
-    tokenizer_src_path = base_path / config['tokenizer_file'].format(config['lang_src'])
-    tokenizer_tgt_path = base_path / config['tokenizer_file'].format(config['lang_tgt'])
+    # Load tokenizers from local paths
+    tokenizer_src_path = Path(config['tokenizer_file'].format(config['lang_src']))
+    tokenizer_tgt_path = Path(config['tokenizer_file'].format(config['lang_tgt']))
     
     if not tokenizer_src_path.exists() or not tokenizer_tgt_path.exists():
-        print("Tokenizer files not found. Please run preprocess.py first.")
+        print("Tokenizer files not found in current directory.")
+        print(f"Expected: {tokenizer_src_path} and {tokenizer_tgt_path}")
         sys.exit(1)
         
     tokenizer_src = Tokenizer.from_file(str(tokenizer_src_path))
@@ -34,13 +30,29 @@ def translate(sentence: str):
         tokenizer_src.get_vocab_size(), 
         tokenizer_tgt.get_vocab_size(), 
         config["seq_len"], 
+        config["seq_len"], 
         config['d_model']
     ).to(device)
 
-    # Load the pretrained weights
-    # Update the epoch number to the best model if needed
-    model_filename = get_weights_path(config, "19") 
-    print(f"Loading model weights from: {model_filename}")
+    # Load the pretrained weights from local weights folder
+    model_filename = f"./weights/tmodel_{int(epoch_number):02d}.pt"
+    print(f"Loading model weights from epoch {epoch_number}: {model_filename}")
+    
+    if not Path(model_filename).exists():
+        print(f"Model checkpoint not found: {model_filename}")
+        print("Available checkpoints in ./weights/:")
+        weights_folder = Path("./weights")
+        if weights_folder.exists():
+            checkpoints = list(weights_folder.glob("tmodel_*.pt"))
+            if checkpoints:
+                for checkpoint in sorted(checkpoints):
+                    print(f"  - {checkpoint.name}")
+            else:
+                print("  No checkpoints found.")
+        else:
+            print("  ./weights/ folder does not exist.")
+        sys.exit(1)
+    
     state = torch.load(model_filename, map_location=device)
     model.load_state_dict(state['model_state_dict'])
 
@@ -79,19 +91,24 @@ def translate(sentence: str):
         output_text_top_k = tokenizer_tgt.decode(model_out_top_k.tolist())
 
     # --- PRINT RESULTS ---
-    print("-" * 30)
+    print("=" * 50)
+    print(f"TESTING EPOCH {epoch_number}")
+    print("=" * 50)
     print(f"SOURCE:    {sentence}")
-    print("-" * 30)
+    print("-" * 50)
     print(f"Greedy:    {output_text_greedy}")
     print(f"Beam (k={config['beam_size']}): {output_text_beam}")
     print(f"Top-k (k={config['top_k']}):  {output_text_top_k}")
-    print("-" * 30)
+    print("=" * 50)
 
 if __name__ == "__main__":
-    # Read sentence from command line argument
-    if len(sys.argv) > 1:
-        sentence_to_translate = " ".join(sys.argv[1:])
-        translate(sentence_to_translate)
-    else:
-        print("Please provide a sentence to translate.")
-        print("Example: python test.py 'This is a test sentence.'")
+    # Read epoch number and sentence from command line arguments
+    if len(sys.argv) < 3:
+        print("Usage: python test.py <epoch_number> <sentence_to_translate>")
+        print("Example: python test.py 1 'Tämä on testivirke.'")
+        print("Example: python test.py 0 'Hello world'")
+        sys.exit(1)
+    
+    epoch_number = sys.argv[1]
+    sentence_to_translate = " ".join(sys.argv[2:])
+    translate(epoch_number, sentence_to_translate)
