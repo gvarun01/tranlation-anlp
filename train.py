@@ -191,6 +191,25 @@ def train_model(config):
     run_evaluation(model, test_dataloader, tokenizer_src, tokenizer_tgt, config['seq_len'], device, print, 0, writer, "test")
 
 if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Train the transformer model")
+    parser.add_argument("--batch_size", type=int, default=32, help="Batch size for training")
+    parser.add_argument("--num_epochs", type=int, default=12, help="Number of epochs to train")
+    parser.add_argument("--lr", type=float, default=10**-4, help="Learning rate")
+    parser.add_argument("--seq_len", type=int, default=150, help="Sequence length")
+    parser.add_argument("--d_model", type=int, default=512, help="Model dimension")
+    
+    args = parser.parse_args()
+    
     warnings.filterwarnings("ignore")
     config = get_config()
+    
+    # Override config with command line arguments
+    config['batch_size'] = args.batch_size
+    config['num_epochs'] = args.num_epochs
+    config['lr'] = args.lr
+    config['seq_len'] = args.seq_len
+    config['d_model'] = args.d_model
+    
     train_model(config)

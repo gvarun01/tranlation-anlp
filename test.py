@@ -6,6 +6,22 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from model import build_transformer
 from utils import get_config, greedy_decode, beam_search_decode, top_k_sampling_decode, BilingualDataset, load_dataset_by_split, find_latest_checkpoint, get_checkpoint_path_for_epoch
+try:
+    import torchmetrics
+    from bert_score import BERTScorer
+    # BLEU score
+    bleu_metric = torchmetrics.text.BLEUScore()
+    
+    # BERTScore
+    # Use a pre-trained model for BERTScore, like 'roberta-large'
+    bert_scorer = BERTScorer(lang="en", rescale_with_baseline=True)
+
+except ImportError:
+    torchmetrics = None
+    bert_scorer = None
+    bleu_metric = None
+    print("torchmetrics or bert_score not available, showing sample predictions only.")
+    print("Please install with: pip install torchmetrics bert-score")
 
 def get_test_dataset(config):
     """Load and create the test dataset for evaluation using pre-defined splits"""
@@ -21,17 +37,16 @@ def get_test_dataset(config):
 
     # Create test dataset and dataloader
     test_dataset = BilingualDataset(test_data, tokenizer_src, tokenizer_tgt, config['lang_src'], config['lang_tgt'], config['seq_len'])
-    test_dataloader = DataLoader(test_dataset, batch_size=1, shuffle=False)
+    test_dataloader = DataLoader(test_dataset, batch_size=config['batch_size'], shuffle=False)
 
     print(f"Test dataset loaded: {len(test_dataset)} examples")
 
     return test_dataloader, tokenizer_src, tokenizer_tgt
 
-def evaluate_model(epoch_number: str):
+def evaluate_model(epoch_number: str, config):
     """Evaluate the model on the test set and calculate BLEU score"""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
-    config = get_config()
     
     # Load tokenizers
     tokenizer_src_path = Path(config['tokenizer_file'].format(config['lang_src']))
@@ -100,37 +115,73 @@ def evaluate_model(epoch_number: str):
     predicted = []
     expected = []
 
-    with torch.no_grad():
-        for batch in tqdm(test_dataloader, desc="Evaluating"):
-            encoder_input = batch['encoder_input'].to(device)
-            encoder_mask = batch['encoder_mask'].to(device)
-
-            # Use greedy decoding for evaluation
-            model_output = greedy_decode(model, encoder_input, encoder_mask, tokenizer_src, tokenizer_tgt, config['seq_len'], device)
-            
-            tgt_text = batch['tgt_text'][0]
-            model_output_text = tokenizer_tgt.decode(model_output.detach().cpu().numpy())
-
-            expected.append(tgt_text)
-            predicted.append(model_output_text)
-
-    # Calculate simple BLEU score manually (since torchmetrics might not be available)
+    # Setup metrics
     try:
         import torchmetrics
+        from bert_score import BERTScorer
         bleu_metric = torchmetrics.text.BLEUScore()
-        bleu = bleu_metric([p.lower() for p in predicted], [[e.lower()] for e in expected])
-        
-        print("=" * 50)
-        print(f"EVALUATION RESULTS FOR EPOCH {epoch_number}")
-        print("=" * 50)
-        print(f"BLEU Score:  {bleu:.4f}")
-        print("=" * 50)
-        
+        bert_scorer = BERTScorer(lang="en", rescale_with_baseline=True, device=device)
+        metrics_available = True
     except ImportError:
+        metrics_available = False
+        print("\nWarning: torchmetrics or bert-score not installed. Skipping BLEU and BERTScore calculation.")
+        print("Install them with: pip install torchmetrics bert-score")
+
+    with torch.no_grad():
+        for batch in tqdm(test_dataloader, desc="Evaluating"):
+            encoder_input = batch['encoder_input'].to(device)  # Shape: (batch_size, seq_len)
+            encoder_mask = batch['encoder_mask'].to(device)    # Shape: (batch_size, 1, seq_len, seq_len)
+            
+            batch_size = encoder_input.size(0)
+            model_outputs = []
+            
+            # Process each example in the batch individually
+            for i in range(batch_size):
+                single_encoder_input = encoder_input[i:i+1]  # Shape: (1, seq_len)
+                single_encoder_mask = encoder_mask[i:i+1]    # Shape: (1, 1, seq_len, seq_len)
+                
+                # Use greedy decoding for each example
+                output = greedy_decode(model, single_encoder_input, single_encoder_mask, tokenizer_src, tokenizer_tgt, config['seq_len'], device)
+                model_outputs.append(output)
+            
+            tgt_texts = batch['tgt_text']
+            model_output_texts = [tokenizer_tgt.decode(output.detach().cpu().numpy()) for output in model_outputs]
+
+            expected.extend(tgt_texts)
+            predicted.extend(model_output_texts)
+
+    # Save predictions and expected translations to files
+    output_dir = Path("results")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    pred_filepath = output_dir / f"predictions_epoch_{epoch_number}.txt"
+    exp_filepath = output_dir / f"expected_epoch_{epoch_number}.txt"
+
+    with open(pred_filepath, "w", encoding="utf-8") as f:
+        f.write("\n".join(predicted))
+    
+    with open(exp_filepath, "w", encoding="utf-8") as f:
+        f.write("\n".join(expected))
+        
+    print(f"Predictions saved to {pred_filepath}")
+    print(f"Expected translations saved to {exp_filepath}")
+
+    print("=" * 50)
+    print(f"EVALUATION RESULTS FOR EPOCH {epoch_number}")
+    print("=" * 50)
+
+    if metrics_available:
+        # Calculate BLEU score
+        bleu = bleu_metric([p.lower() for p in predicted], [[e.lower()] for e in expected])
+        print(f"BLEU Score:      {bleu:.4f}")
+
+        # Calculate BERTScore
+        P, R, F1 = bert_scorer.score(predicted, expected)
+        bert_f1_score = F1.mean()
+        print(f"BERTScore (F1):  {bert_f1_score:.4f}")
         print("=" * 50)
-        print(f"EVALUATION RESULTS FOR EPOCH {epoch_number}")
-        print("=" * 50)
-        print("torchmetrics not available, showing sample predictions:")
+    else:
+        print("Metrics not available, showing sample predictions only.")
         print("=" * 50)
         
     # Show a few examples
@@ -141,13 +192,12 @@ def evaluate_model(epoch_number: str):
         print(f"Predicted: {predicted[i]}")
         print("-" * 50)
 
-def translate(epoch_number: str, sentence: str):
+def translate(epoch_number: str, sentence: str, config):
     """
     Translates a sentence using greedy, beam search, and top-k sampling decoding strategies.
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
-    config = get_config()
     
     # Load tokenizers from local paths
     tokenizer_src_path = Path(config['tokenizer_file'].format(config['lang_src']))
@@ -253,19 +303,27 @@ def translate(epoch_number: str, sentence: str):
     print("=" * 50)
 
 if __name__ == "__main__":
-    # Check for evaluation mode
-    if len(sys.argv) >= 3 and "--evaluate" in sys.argv:
-        epoch_number = sys.argv[1]
-        evaluate_model(epoch_number)
-    elif len(sys.argv) >= 3:
-        # Translation mode
-        epoch_number = sys.argv[1]
-        sentence_to_translate = " ".join(sys.argv[2:])
-        translate(epoch_number, sentence_to_translate)
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Test the transformer model")
+    parser.add_argument("epoch_number", help="Epoch number to load")
+    parser.add_argument("sentence", nargs='?', help="Sentence to translate (if not evaluating)")
+    parser.add_argument("--evaluate", action="store_true", help="Run evaluation instead of translation")
+    parser.add_argument("--batch_size", type=int, default=32, help="Batch size for evaluation")
+    
+    args = parser.parse_args()
+    
+    config = get_config()
+    config['batch_size'] = args.batch_size
+    
+    if args.evaluate:
+        evaluate_model(args.epoch_number, config)
+    elif args.sentence:
+        translate(args.epoch_number, args.sentence, config)
     else:
         print("Usage:")
-        print("  Translation: python test.py <epoch_number> <sentence_to_translate>")
-        print("  Evaluation:  python test.py <epoch_number> --evaluate")
+        print("  Translation: python test.py <epoch_number> <sentence_to_translate> [--batch_size BATCH_SIZE]")
+        print("  Evaluation:  python test.py <epoch_number> --evaluate [--batch_size BATCH_SIZE]")
         print("Examples:")
-        print("  python test.py 1 'Tämä on testivirke.'")
-        print("  python test.py 4 --evaluate")
+        print("  python test.py 1 'Tämä on testivirke.' --batch_size 16")
+        print("  python test.py 4 --evaluate --batch_size 32")

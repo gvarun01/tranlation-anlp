@@ -10,7 +10,7 @@ from tokenizers import Tokenizer
 # From config.py
 def get_config():
     return {
-        "batch_size": 32,
+        "batch_size": 64,
         "num_epochs": 12,
         "lr": 10**-4,
         "seq_len": 150,
@@ -77,7 +77,11 @@ def get_checkpoint_path_for_epoch(config, epoch_number):
     Get checkpoint path for a specific epoch. Searches in working directory first, then Kaggle input.
     """
     model_basename = config['model_basename']
-    epoch_str = f"{int(epoch_number):02d}"
+    try:
+        epoch_str = f"{int(epoch_number):02d}"
+    except ValueError:
+        print(f"Invalid epoch number: {epoch_number}. Expected an integer.")
+        return None
     checkpoint_filename = f"{model_basename}{epoch_str}.pt"
     
     # Check local working directory first
