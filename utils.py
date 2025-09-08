@@ -19,7 +19,7 @@ def get_config():
         "lang_tgt": "en",
         "model_folder": "weights",
         "model_basename": "tmodel_",
-        "preload": "06",
+        "preload": None,
         "tokenizer_file": "tokenizer_{0}.json",
         "experiment_name": "runs/tmodel",
         "datasource": "local",
@@ -37,6 +37,65 @@ def get_weights_path(config, epoch: str):
     
     base_path = Path('.')
     return str(base_path / model_folder / model_filename)
+
+def find_latest_checkpoint(config):
+    """
+    Find the latest checkpoint in the working directory or Kaggle input.
+    Returns (checkpoint_path, epoch_number) or (None, None) if no checkpoint found.
+    """
+    model_basename = config['model_basename']
+    
+    # Check local working directory first
+    local_weights_dir = Path('.') / config['model_folder']
+    if local_weights_dir.exists():
+        local_checkpoints = list(local_weights_dir.glob(f"{model_basename}*.pt"))
+        if local_checkpoints:
+            # Find the latest checkpoint by epoch number
+            latest_local = max(local_checkpoints, key=lambda x: int(x.stem.split('_')[-1]))
+            epoch_num = int(latest_local.stem.split('_')[-1])
+            print(f"Found latest local checkpoint: {latest_local}")
+            return str(latest_local), epoch_num
+    
+    # Check Kaggle input directory
+    kaggle_input_dir = Path('/kaggle/input')
+    if kaggle_input_dir.exists():
+        # Look for any translation-related input directories
+        for input_dir in kaggle_input_dir.iterdir():
+            if input_dir.is_dir() and 'translation' in input_dir.name.lower():
+                kaggle_checkpoints = list(input_dir.glob(f"{model_basename}*.pt"))
+                if kaggle_checkpoints:
+                    latest_kaggle = max(kaggle_checkpoints, key=lambda x: int(x.stem.split('_')[-1]))
+                    epoch_num = int(latest_kaggle.stem.split('_')[-1])
+                    print(f"Found latest Kaggle checkpoint: {latest_kaggle}")
+                    return str(latest_kaggle), epoch_num
+    
+    print("No existing checkpoints found. Starting training from scratch.")
+    return None, None
+
+def get_checkpoint_path_for_epoch(config, epoch_number):
+    """
+    Get checkpoint path for a specific epoch. Searches in working directory first, then Kaggle input.
+    """
+    model_basename = config['model_basename']
+    epoch_str = f"{int(epoch_number):02d}"
+    checkpoint_filename = f"{model_basename}{epoch_str}.pt"
+    
+    # Check local working directory first
+    local_path = Path('.') / config['model_folder'] / checkpoint_filename
+    if local_path.exists():
+        return str(local_path)
+    
+    # Check Kaggle input directory
+    kaggle_input_dir = Path('/kaggle/input')
+    if kaggle_input_dir.exists():
+        for input_dir in kaggle_input_dir.iterdir():
+            if input_dir.is_dir() and 'translation' in input_dir.name.lower():
+                kaggle_path = input_dir / checkpoint_filename
+                if kaggle_path.exists():
+                    return str(kaggle_path)
+    
+    # Return None if not found
+    return None
 
 # From model.py (shared layers)
 class LayerNormalization(nn.Module):

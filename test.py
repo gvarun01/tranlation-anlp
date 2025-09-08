@@ -5,7 +5,7 @@ from tokenizers import Tokenizer
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from model import build_transformer
-from utils import get_config, greedy_decode, beam_search_decode, top_k_sampling_decode, BilingualDataset, load_dataset_by_split
+from utils import get_config, greedy_decode, beam_search_decode, top_k_sampling_decode, BilingualDataset, load_dataset_by_split, find_latest_checkpoint, get_checkpoint_path_for_epoch
 
 def get_test_dataset(config):
     """Load and create the test dataset for evaluation using pre-defined splits"""
@@ -54,27 +54,42 @@ def evaluate_model(epoch_number: str):
         d_model=config['d_model']
     ).to(device)
 
-    # Load the pretrained weights from local weights folder
-    model_filename = f"./weights/tmodel_{int(epoch_number):02d}.pt"
-    print(f"Loading model weights from epoch {epoch_number}: {model_filename}")
-    
-    if not Path(model_filename).exists():
-        print(f"Model checkpoint not found: {model_filename}")
-        print("Available checkpoints in ./weights/:")
+    # Load the pretrained weights using auto-detection
+    model_filename = get_checkpoint_path_for_epoch(config, epoch_number)
+    if model_filename:
+        print(f"Loading model weights from epoch {epoch_number}: {model_filename}")
+        try:
+            state = torch.load(model_filename, map_location=device, weights_only=False)
+            model.load_state_dict(state['model_state_dict'])
+        except Exception as e:
+            print(f"Error loading checkpoint: {e}")
+            sys.exit(1)
+    else:
+        print(f"Model checkpoint for epoch {epoch_number} not found!")
+        print("Available checkpoints:")
+        
+        # Show available checkpoints
         weights_folder = Path("./weights")
         if weights_folder.exists():
-            checkpoints = list(weights_folder.glob("tmodel_*.pt"))
-            if checkpoints:
-                for checkpoint in sorted(checkpoints):
-                    print(f"  - {checkpoint.name}")
-            else:
-                print("  No checkpoints found.")
-        else:
-            print("  ./weights/ folder does not exist.")
+            local_checkpoints = list(weights_folder.glob("tmodel_*.pt"))
+            if local_checkpoints:
+                print("  Local directory:")
+                for checkpoint in sorted(local_checkpoints):
+                    epoch_num = checkpoint.stem.split('_')[-1]
+                    print(f"    - Epoch {epoch_num}: {checkpoint.name}")
+        
+        kaggle_input_dir = Path('/kaggle/input')
+        if kaggle_input_dir.exists():
+            for input_dir in kaggle_input_dir.iterdir():
+                if input_dir.is_dir() and 'translation' in input_dir.name.lower():
+                    kaggle_checkpoints = list(input_dir.glob("tmodel_*.pt"))
+                    if kaggle_checkpoints:
+                        print(f"  Kaggle input ({input_dir.name}):")
+                        for checkpoint in sorted(kaggle_checkpoints):
+                            epoch_num = checkpoint.stem.split('_')[-1]
+                            print(f"    - Epoch {epoch_num}: {checkpoint.name}")
+        
         sys.exit(1)
-    
-    state = torch.load(model_filename, map_location=device, weights_only=False)
-    model.load_state_dict(state['model_state_dict'])
 
     # Get test dataset
     test_dataloader, _, _ = get_test_dataset(config)
@@ -155,27 +170,42 @@ def translate(epoch_number: str, sentence: str):
         d_model=config['d_model']
     ).to(device)
 
-    # Load the pretrained weights from local weights folder
-    model_filename = f"./weights/tmodel_{int(epoch_number):02d}.pt"
-    print(f"Loading model weights from epoch {epoch_number}: {model_filename}")
-    
-    if not Path(model_filename).exists():
-        print(f"Model checkpoint not found: {model_filename}")
-        print("Available checkpoints in ./weights/:")
+    # Load the pretrained weights using auto-detection
+    model_filename = get_checkpoint_path_for_epoch(config, epoch_number)
+    if model_filename:
+        print(f"Loading model weights from epoch {epoch_number}: {model_filename}")
+        try:
+            state = torch.load(model_filename, map_location=device, weights_only=False)
+            model.load_state_dict(state['model_state_dict'])
+        except Exception as e:
+            print(f"Error loading checkpoint: {e}")
+            sys.exit(1)
+    else:
+        print(f"Model checkpoint for epoch {epoch_number} not found!")
+        print("Available checkpoints:")
+        
+        # Show available checkpoints
         weights_folder = Path("./weights")
         if weights_folder.exists():
-            checkpoints = list(weights_folder.glob("tmodel_*.pt"))
-            if checkpoints:
-                for checkpoint in sorted(checkpoints):
-                    print(f"  - {checkpoint.name}")
-            else:
-                print("  No checkpoints found.")
-        else:
-            print("  ./weights/ folder does not exist.")
+            local_checkpoints = list(weights_folder.glob("tmodel_*.pt"))
+            if local_checkpoints:
+                print("  Local directory:")
+                for checkpoint in sorted(local_checkpoints):
+                    epoch_num = checkpoint.stem.split('_')[-1]
+                    print(f"    - Epoch {epoch_num}: {checkpoint.name}")
+        
+        kaggle_input_dir = Path('/kaggle/input')
+        if kaggle_input_dir.exists():
+            for input_dir in kaggle_input_dir.iterdir():
+                if input_dir.is_dir() and 'translation' in input_dir.name.lower():
+                    kaggle_checkpoints = list(input_dir.glob("tmodel_*.pt"))
+                    if kaggle_checkpoints:
+                        print(f"  Kaggle input ({input_dir.name}):")
+                        for checkpoint in sorted(kaggle_checkpoints):
+                            epoch_num = checkpoint.stem.split('_')[-1]
+                            print(f"    - Epoch {epoch_num}: {checkpoint.name}")
+        
         sys.exit(1)
-    
-    state = torch.load(model_filename, map_location=device, weights_only=False)
-    model.load_state_dict(state['model_state_dict'])
 
     seq_len = config['seq_len']
 

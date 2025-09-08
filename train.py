@@ -11,6 +11,7 @@ from model import build_transformer
 from utils import (
     get_config,
     get_weights_path,
+    find_latest_checkpoint,
     get_or_build_tokenizer,
     BilingualDataset,
     greedy_decode,
@@ -123,35 +124,25 @@ def train_model(config):
     initial_epoch = 0
     global_step = 0
     
-    # Check for existing checkpoints to resume from
-    if config['preload']:
-        model_filename = get_weights_path(config, config['preload'])
-        print(f"Preloading model {model_filename}")
-        state = torch.load(model_filename)
-        model.load_state_dict(state['model_state_dict'])
-        initial_epoch = state['epoch'] + 1
-        optimizer.load_state_dict(state['optimizer_state_dict'])
-        global_step = state['global_step']
+    # Auto-detect and load the latest checkpoint
+    checkpoint_path, latest_epoch = find_latest_checkpoint(config)
+    if checkpoint_path:
+        print(f"Loading checkpoint: {checkpoint_path}")
+        try:
+            state = torch.load(checkpoint_path, map_location=device, weights_only=False)
+            model.load_state_dict(state['model_state_dict'])
+            initial_epoch = state['epoch'] + 1
+            optimizer.load_state_dict(state['optimizer_state_dict'])
+            global_step = state.get('global_step', 0)
+            print(f"Resumed training from epoch {initial_epoch} (continuing from epoch {latest_epoch})")
+        except Exception as e:
+            print(f"Error loading checkpoint: {e}")
+            print("Starting training from scratch...")
+            initial_epoch = 0
+            global_step = 0
     else:
-        # Auto-resume from latest checkpoint if available
-        base_path = Path('.')
-        
-        model_folder = base_path / config['model_folder']
-        if model_folder.exists():
-            # Find the latest checkpoint
-            checkpoints = list(model_folder.glob(f"{config['model_basename']}*.pt"))
-            if checkpoints:
-                latest_checkpoint = max(checkpoints, key=lambda x: int(x.stem.split('_')[-1]))
-                print(f"Found existing checkpoint: {latest_checkpoint}")
-                print("Do you want to resume from this checkpoint? (y/n)")
-                response = input().strip().lower()
-                if response == 'y':
-                    state = torch.load(latest_checkpoint)
-                    model.load_state_dict(state['model_state_dict'])
-                    initial_epoch = state['epoch'] + 1
-                    optimizer.load_state_dict(state['optimizer_state_dict'])
-                    global_step = state['global_step']
-                    print(f"Resumed training from epoch {initial_epoch}")
+        print("Starting training from scratch...")
+        initial_epoch = 0
 
     loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer_src.token_to_id('[PAD]'), label_smoothing=0.1).to(device)
 
