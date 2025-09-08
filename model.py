@@ -1,6 +1,15 @@
 import torch
 import torch.nn as nn
 import math
+from encoder import Encoder, EncoderBlock
+from decoder import Decoder, DecoderBlock
+from utils import (
+    InputEmbeddings,
+    RotaryPositionalEmbedding,
+    MultiHeadAttentionBlock,
+    FeedForwardBlock,
+    ProjectionLayer,
+)
 
 class LayerNormalization(nn.Module):
     def __init__(self, features: int, eps:float=10**-6) -> None:
@@ -41,30 +50,34 @@ class InputEmbeddings(nn.Module):
         # Multiply by sqrt(d_model) to scale the embeddings according to the paper
         return self.embedding(x) * math.sqrt(self.d_model)
     
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model: int, seq_len: int, dropout: float) -> None:
+class RotaryPositionalEmbedding(nn.Module):
+    def __init__(self, dim: int, max_seq_len: int = 5000) -> None:
         super().__init__()
-        self.d_model = d_model
-        self.seq_len = seq_len
-        self.dropout = nn.Dropout(dropout)
-        # Create a matrix of shape (seq_len, d_model)
-        pe = torch.zeros(seq_len, d_model)
-        # Create a vector of shape (seq_len)
-        position = torch.arange(0, seq_len, dtype=torch.float).unsqueeze(1) # (seq_len, 1)
-        # Create a vector of shape (d_model)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model)) # (d_model / 2)
-        # Apply sine to even indices
-        pe[:, 0::2] = torch.sin(position * div_term) # sin(position * (10000 ** (2i / d_model))
-        # Apply cosine to odd indices
-        pe[:, 1::2] = torch.cos(position * div_term) # cos(position * (10000 ** (2i / d_model))
-        # Add a batch dimension to the positional encoding
-        pe = pe.unsqueeze(0) # (1, seq_len, d_model)
-        # Register the positional encoding as a buffer
-        self.register_buffer('pe', pe)
+        self.dim = dim
+        self.max_seq_len = max_seq_len
 
-    def forward(self, x):
-        x = x + (self.pe[:, :x.shape[1], :]).requires_grad_(False) # (batch, seq_len, d_model)
-        return self.dropout(x)
+        # Create the positional encodings once in log_space.
+        self.register_buffer("positional_encodings", self._get_positional_encodings(max_seq_len, dim))
+
+    def _get_positional_encodings(self, max_seq_len: int, dim: int):
+        # pe: (max_seq_len, dim)
+        pe = torch.zeros(max_seq_len, dim)
+        # position: (max_seq_len, 1)
+        position = torch.arange(0, max_seq_len, dtype=torch.float).unsqueeze(1)
+        # div_term: (dim / 2)
+        div_term = torch.exp(torch.arange(0, dim, 2).float() * (-math.log(10000.0) / dim))
+        # Apply sine to even indices
+        pe[:, 0::2] = torch.sin(position * div_term)
+        # Apply cosine to odd indices
+        pe[:, 1::2] = torch.cos(position * div_term)
+        return pe
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (batch, seq_len, dim)
+        # pe: (1, seq_len, dim)
+        pe = self.positional_encodings[:x.size(1), :].detach()
+        # Add the rotary positional encodings to the input embeddings
+        return x + pe
 
 class ResidualConnection(nn.Module):
         def __init__(self, features: int, dropout: float) -> None:
@@ -76,7 +89,7 @@ class ResidualConnection(nn.Module):
             return x + self.dropout(sublayer(self.norm(x)))
 
 class MultiHeadAttentionBlock(nn.Module):
-    def __init__(self, d_model: int, h: int, dropout: float) -> None:
+    def __init__(self, d_model: int, h: int, dropout: float, rope: RotaryPositionalEmbedding = None) -> None:
         super().__init__()
         self.d_model = d_model # Embedding vector size
         self.h = h # Number of heads
@@ -89,6 +102,7 @@ class MultiHeadAttentionBlock(nn.Module):
         self.w_v = nn.Linear(d_model, d_model, bias=False) # Wv
         self.w_o = nn.Linear(d_model, d_model, bias=False) # Wo
         self.dropout = nn.Dropout(dropout)
+        self.rope = rope
 
     @staticmethod
     def attention(query, key, value, mask, dropout: nn.Dropout):
@@ -115,6 +129,12 @@ class MultiHeadAttentionBlock(nn.Module):
         query = query.view(query.shape[0], query.shape[1], self.h, self.d_k).transpose(1, 2)
         key = key.view(key.shape[0], key.shape[1], self.h, self.d_k).transpose(1, 2)
         value = value.view(value.shape[0], value.shape[1], self.h, self.d_k).transpose(1, 2)
+
+        # Apply RoPE to query and key
+        if self.rope is not None:
+            seq_len = query.size(2)
+            query = query * self.rope(pos=seq_len)
+            key = key * self.rope(pos=seq_len)
 
         # Calculate attention
         x, self.attention_scores = MultiHeadAttentionBlock.attention(query, key, value, mask, self.dropout)
@@ -185,26 +205,22 @@ class ProjectionLayer(nn.Module):
         return self.proj(x)
     
 class Transformer(nn.Module):
-    def __init__(self, encoder: Encoder, decoder: Decoder, src_embed: InputEmbeddings, tgt_embed: InputEmbeddings, src_pos: PositionalEncoding, tgt_pos: PositionalEncoding, projection_layer: ProjectionLayer) -> None:
+    def __init__(self, encoder: Encoder, decoder: Decoder, src_embed: InputEmbeddings, tgt_embed: InputEmbeddings, projection_layer: ProjectionLayer) -> None:
         super().__init__()
         self.encoder = encoder
         self.decoder = decoder
         self.src_embed = src_embed
         self.tgt_embed = tgt_embed
-        self.src_pos = src_pos
-        self.tgt_pos = tgt_pos
         self.projection_layer = projection_layer
 
     def encode(self, src, src_mask):
         # (batch, seq_len, d_model)
         src = self.src_embed(src)
-        src = self.src_pos(src)
         return self.encoder(src, src_mask)
     
     def decode(self, encoder_output: torch.Tensor, src_mask: torch.Tensor, tgt: torch.Tensor, tgt_mask: torch.Tensor):
         # (batch, seq_len, d_model)
         tgt = self.tgt_embed(tgt)
-        tgt = self.tgt_pos(tgt)
         return self.decoder(tgt, encoder_output, src_mask, tgt_mask)
     
     def project(self, x):
@@ -216,14 +232,13 @@ def build_transformer(src_vocab_size: int, tgt_vocab_size: int, src_seq_len: int
     src_embed = InputEmbeddings(d_model, src_vocab_size)
     tgt_embed = InputEmbeddings(d_model, tgt_vocab_size)
 
-    # Create the positional encoding layers
-    src_pos = PositionalEncoding(d_model, src_seq_len, dropout)
-    tgt_pos = PositionalEncoding(d_model, tgt_seq_len, dropout)
+    # Create the rotary positional embedding layer
+    rope = RotaryPositionalEmbedding(d_model // h, max_seq_len=max(src_seq_len, tgt_seq_len))
     
     # Create the encoder blocks
     encoder_blocks = []
     for _ in range(N):
-        encoder_self_attention_block = MultiHeadAttentionBlock(d_model, h, dropout)
+        encoder_self_attention_block = MultiHeadAttentionBlock(d_model, h, dropout, rope)
         feed_forward_block = FeedForwardBlock(d_model, d_ff, dropout)
         encoder_block = EncoderBlock(d_model, encoder_self_attention_block, feed_forward_block, dropout)
         encoder_blocks.append(encoder_block)
@@ -231,8 +246,8 @@ def build_transformer(src_vocab_size: int, tgt_vocab_size: int, src_seq_len: int
     # Create the decoder blocks
     decoder_blocks = []
     for _ in range(N):
-        decoder_self_attention_block = MultiHeadAttentionBlock(d_model, h, dropout)
-        decoder_cross_attention_block = MultiHeadAttentionBlock(d_model, h, dropout)
+        decoder_self_attention_block = MultiHeadAttentionBlock(d_model, h, dropout, rope)
+        decoder_cross_attention_block = MultiHeadAttentionBlock(d_model, h, dropout, rope=None) # No RoPE for cross-attention
         feed_forward_block = FeedForwardBlock(d_model, d_ff, dropout)
         decoder_block = DecoderBlock(d_model, decoder_self_attention_block, decoder_cross_attention_block, feed_forward_block, dropout)
         decoder_blocks.append(decoder_block)
@@ -245,7 +260,7 @@ def build_transformer(src_vocab_size: int, tgt_vocab_size: int, src_seq_len: int
     projection_layer = ProjectionLayer(d_model, tgt_vocab_size)
     
     # Create the transformer
-    transformer = Transformer(encoder, decoder, src_embed, tgt_embed, src_pos, tgt_pos, projection_layer)
+    transformer = Transformer(encoder, decoder, src_embed, tgt_embed, projection_layer)
     
     # Initialize the parameters
     for p in transformer.parameters():

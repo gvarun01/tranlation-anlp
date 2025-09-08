@@ -71,10 +71,30 @@ def run_validation(model, validation_dataset, tokenizer_src, tokenizer_tgt, max_
         writer.flush()
 
 def get_dataset(config):
-    dataset_raw = load_dataset('opus_books', f'{config["lang_src"]}-{config["lang_tgt"]}', split='train')
-    
-    tokenizer_src = get_or_build_tokenizer(config, dataset_raw, config['lang_src'])
-    tokenizer_tgt = get_or_build_tokenizer(config, dataset_raw, config['lang_tgt'])
+    # Load the dataset from local files
+    src_lang = config['lang_src']
+    tgt_lang = config['lang_tgt']
+    data_path = Path('data')
+    src_path = data_path / f"EUbookshop.{src_lang}"
+    tgt_path = data_path / f"EUbookshop.{tgt_lang}"
+
+    with open(src_path, 'r', encoding='utf-8') as f:
+        src_lines = f.read().splitlines()
+    with open(tgt_path, 'r', encoding='utf-8') as f:
+        tgt_lines = f.read().splitlines()
+
+    # Create a dataset in the expected format
+    dataset_raw = []
+    for src, tgt in zip(src_lines, tgt_lines):
+        dataset_raw.append({
+            'translation': {
+                src_lang: src,
+                tgt_lang: tgt
+            }
+        })
+
+    tokenizer_src = get_or_build_tokenizer(config, None, src_lang)
+    tokenizer_tgt = get_or_build_tokenizer(config, None, tgt_lang)
 
     # Filter and split the dataset
     filtered_data = [
@@ -108,7 +128,15 @@ def get_model(config, vocab_src_len, vocab_tgt_len):
 def train_model(config):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
-    Path(config['model_folder']).mkdir(parents=True, exist_ok=True)
+
+    # Set up the base path for saving models and tokenizers
+    base_path = Path('.')
+    gdrive_path = config.get('gdrive_path')
+    if gdrive_path:
+        base_path = Path(gdrive_path)
+    
+    # Make sure the model folder exists
+    (base_path / config['model_folder']).mkdir(parents=True, exist_ok=True)
 
     train_dataloader, validation_dataloader, tokenizer_src, tokenizer_tgt = get_dataset(config)
     model = get_model(config, tokenizer_src.get_vocab_size(), tokenizer_tgt.get_vocab_size()).to(device)

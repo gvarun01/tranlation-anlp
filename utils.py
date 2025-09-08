@@ -9,25 +9,37 @@ from datasets import load_dataset
 # From config.py
 def get_config():
     return {
-        "batch_size" : 8,
+        "batch_size": 8,
         "num_epochs": 20,
         "lr": 10**-4,
-        "seq_len" : 350, 
-        "d_model" : 512,
-        "lang_src": "de",
+        "seq_len": 150,
+        "d_model": 512,
+        "lang_src": "fi",
         "lang_tgt": "en",
         "model_folder": "weights",
         "model_basename": "tmodel_",
         "preload": None,
         "tokenizer_file": "tokenizer_{0}.json",
-        "experiment_name": "runs/tmodel"
+        "experiment_name": "runs/tmodel",
+        "datasource": "local",
+        "positional_encoding": "rope", # or "sinusoidal", "relative"
+        "decoding_strategy": "greedy", # or "beam", "top-k"
+        "beam_size": 5,
+        "top_k": 3,
+        "gdrive_path": "/content/drive/MyDrive/translation_anlp/"
     }
 
 def get_weights_path(config, epoch: str):
-    model_folder =  config['model_folder']
+    model_folder = config['model_folder']
     model_basename = config['model_basename']
     model_filename = f"{model_basename}{epoch}.pt"
-    return str(Path(".")/model_folder/model_filename)
+    
+    base_path = Path('.')
+    gdrive_path = config.get('gdrive_path')
+    if gdrive_path:
+        base_path = Path(gdrive_path)
+        
+    return str(base_path / model_folder / model_filename)
 
 # From model.py (shared layers)
 class LayerNormalization(nn.Module):
@@ -61,24 +73,35 @@ class InputEmbeddings(nn.Module):
 
     def forward(self, x):
         return self.embedding(x) * math.sqrt(self.d_model)
-    
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model: int, seq_len: int, dropout: float) -> None:
-        super().__init__()
-        self.d_model = d_model
-        self.seq_len = seq_len
-        self.dropout = nn.Dropout(dropout)
-        pe = torch.zeros(seq_len, d_model)
-        position = torch.arange(0, seq_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0)
-        self.register_buffer('pe', pe)
 
-    def forward(self, x):
-        x = x + (self.pe[:, :x.shape[1], :]).requires_grad_(False)
-        return self.dropout(x)
+class RotaryPositionalEmbedding(nn.Module):
+    def __init__(self, dim: int, max_seq_len: int):
+        super().__init__()
+        self.dim = dim
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+        t = torch.arange(max_seq_len, dtype=inv_freq.dtype)
+        freqs = torch.einsum("i,j->ij", t, inv_freq)
+        # Different from paper, but it uses a different permutation in order to obtain the same calculation
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos", emb.cos())
+        self.register_buffer("sin", emb.sin())
+
+    def forward(self, x: torch.Tensor):
+        # x: (batch, h, seq_len, d_k)
+        seq_len = x.shape[2]
+        cos = self.cos[:seq_len, :]
+        sin = self.sin[:seq_len, :]
+        
+        # Reshape x to apply rotation to pairs of features
+        x_reshaped = x.reshape(*x.shape[:-1], -1, 2)
+        x_rotated = torch.stack(
+            [
+                x_reshaped[..., 0] * cos - x_reshaped[..., 1] * sin,
+                x_reshaped[..., 0] * sin + x_reshaped[..., 1] * cos,
+            ],
+            dim=-1,
+        )
+        return x_rotated.flatten(-2)
 
 class ResidualConnection(nn.Module):
     def __init__(self, features: int, dropout: float) -> None:
@@ -90,7 +113,7 @@ class ResidualConnection(nn.Module):
         return x + self.dropout(sublayer(self.norm(x)))
 
 class MultiHeadAttentionBlock(nn.Module):
-    def __init__(self, d_model: int, h: int, dropout: float) -> None:
+    def __init__(self, d_model: int, h: int, dropout: float, rope: RotaryPositionalEmbedding = None) -> None:
         super().__init__()
         self.d_model = d_model
         self.h = h
@@ -101,6 +124,7 @@ class MultiHeadAttentionBlock(nn.Module):
         self.w_v = nn.Linear(d_model, d_model, bias=False)
         self.w_o = nn.Linear(d_model, d_model, bias=False)
         self.dropout = nn.Dropout(dropout)
+        self.rope = rope
 
     @staticmethod
     def attention(query, key, value, mask, dropout: nn.Dropout):
@@ -117,9 +141,15 @@ class MultiHeadAttentionBlock(nn.Module):
         query = self.w_q(q)
         key = self.w_k(k)
         value = self.w_v(v)
+        
         query = query.view(query.shape[0], query.shape[1], self.h, self.d_k).transpose(1, 2)
         key = key.view(key.shape[0], key.shape[1], self.h, self.d_k).transpose(1, 2)
         value = value.view(value.shape[0], value.shape[1], self.h, self.d_k).transpose(1, 2)
+
+        if self.rope:
+            query = self.rope(query)
+            key = self.rope(key)
+
         x, self.attention_scores = MultiHeadAttentionBlock.attention(query, key, value, mask, self.dropout)
         x = x.transpose(1, 2).contiguous().view(x.shape[0], -1, self.h * self.d_k)
         return self.w_o(x)
@@ -172,20 +202,33 @@ def causal_mask(size):
     return mask == 0
 
 # From train.py (helpers)
-def get_all_sentences(dataset, language):
-    for item in dataset:
-        yield item['translation'][language]
+def get_all_sentences(config, language):
+    data_path = Path('data')
+    file_path = data_path / f"EUbookshop.{language}"
+    with open(file_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            yield line.strip()
 
 def get_or_build_tokenizer(config, dataset, language):
-    tokenizer_path = Path(config['tokenizer_file'].format(language))
-    if not Path.exists(tokenizer_path):
+    base_path = Path('.')
+    gdrive_path = config.get('gdrive_path')
+    if gdrive_path:
+        base_path = Path(gdrive_path)
+    
+    tokenizer_path = base_path / config['tokenizer_file'].format(language)
+    
+    if not tokenizer_path.exists():
         from tokenizers.models import WordLevel
         from tokenizers.trainers import WordLevelTrainer
         from tokenizers.pre_tokenizers import Whitespace
         tokenizer = Tokenizer(WordLevel(unk_token="[UNK]"))
         tokenizer.pre_tokenizer = Whitespace()
         trainer = WordLevelTrainer(special_tokens=["[UNK]", "[PAD]", "[SOS]", "[EOS]"], min_frequency=2)
-        tokenizer.train_from_iterator(get_all_sentences(dataset, language), trainer=trainer)
+        
+        # Ensure the directory for the tokenizer exists
+        tokenizer_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        tokenizer.train_from_iterator(get_all_sentences(config, language), trainer=trainer)
         tokenizer.save(str(tokenizer_path))
     else:
         tokenizer = Tokenizer.from_file(str(tokenizer_path))
