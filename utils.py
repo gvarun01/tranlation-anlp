@@ -9,8 +9,8 @@ from datasets import load_dataset
 # From config.py
 def get_config():
     return {
-        "batch_size": 8,
-        "num_epochs": 20,
+        "batch_size": 32,
+        "num_epochs": 12,
         "lr": 10**-4,
         "seq_len": 150,
         "d_model": 512,
@@ -88,20 +88,32 @@ class RotaryPositionalEmbedding(nn.Module):
 
     def forward(self, x: torch.Tensor):
         # x: (batch, h, seq_len, d_k)
-        seq_len = x.shape[2]
-        cos = self.cos[:seq_len, :]
-        sin = self.sin[:seq_len, :]
+        batch_size, num_heads, seq_len, d_k = x.shape
         
-        # Reshape x to apply rotation to pairs of features
-        x_reshaped = x.reshape(*x.shape[:-1], -1, 2)
+        # Get cos and sin for the sequence length and feature dimension
+        cos = self.cos[:seq_len, :d_k]  # (seq_len, d_k)
+        sin = self.sin[:seq_len, :d_k]  # (seq_len, d_k)
+        
+        # Reshape cos and sin to match x dimensions: (1, 1, seq_len, d_k)
+        cos = cos.unsqueeze(0).unsqueeze(0)  # (1, 1, seq_len, d_k)
+        sin = sin.unsqueeze(0).unsqueeze(0)  # (1, 1, seq_len, d_k)
+        
+        # Reshape x to apply rotation to pairs of features: (..., d_k//2, 2)
+        x_reshaped = x.reshape(batch_size, num_heads, seq_len, d_k // 2, 2)
+        cos_reshaped = cos.reshape(1, 1, seq_len, d_k // 2, 2)
+        sin_reshaped = sin.reshape(1, 1, seq_len, d_k // 2, 2)
+        
+        # Apply rotary transformation
         x_rotated = torch.stack(
             [
-                x_reshaped[..., 0] * cos - x_reshaped[..., 1] * sin,
-                x_reshaped[..., 0] * sin + x_reshaped[..., 1] * cos,
+                x_reshaped[..., 0] * cos_reshaped[..., 0] - x_reshaped[..., 1] * sin_reshaped[..., 0],
+                x_reshaped[..., 0] * sin_reshaped[..., 1] + x_reshaped[..., 1] * cos_reshaped[..., 1],
             ],
             dim=-1,
         )
-        return x_rotated.flatten(-2)
+        
+        # Reshape back to original dimensions
+        return x_rotated.reshape(batch_size, num_heads, seq_len, d_k)
 
 class ResidualConnection(nn.Module):
     def __init__(self, features: int, dropout: float) -> None:
@@ -249,4 +261,80 @@ def greedy_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt, max_
         decoder_input = torch.cat([decoder_input, torch.empty(1, 1).type_as(source).fill_(next_word.item()).to(device)], dim=1)
         if next_word.item() == eos_idx:
             break
+    return decoder_input.squeeze(0)
+
+def beam_search_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt, max_len, device, beam_size):
+    sos_idx = tokenizer_tgt.token_to_id('[SOS]')
+    eos_idx = tokenizer_tgt.token_to_id('[EOS]')
+
+    encoder_output = model.encode(source, source_mask)
+
+    # Start with a single beam containing only the SOS token
+    beams = [(torch.tensor([sos_idx], dtype=torch.long, device=device), 0.0)]
+
+    for _ in range(max_len):
+        new_beams = []
+        all_ended = True
+        for seq, score in beams:
+            if seq[-1].item() == eos_idx:
+                new_beams.append((seq, score))
+                continue
+            
+            all_ended = False
+
+            decoder_input = seq.unsqueeze(0)
+            decoder_mask = causal_mask(decoder_input.size(1)).type_as(source_mask).to(device)
+            
+            decoder_output = model.decode(encoder_output, source_mask, decoder_input, decoder_mask)
+            
+            prob = model.project(decoder_output[:, -1])
+            log_prob = torch.log_softmax(prob, dim=-1)
+            
+            top_k_log_probs, top_k_indices = torch.topk(log_prob, beam_size, dim=-1)
+
+            for i in range(beam_size):
+                new_seq = torch.cat([seq, top_k_indices[0, i].unsqueeze(0)], dim=0)
+                new_score = score + top_k_log_probs[0, i].item()
+                new_beams.append((new_seq, new_score))
+
+        # Sort all new beams by score and keep the top `beam_size`
+        beams = sorted(new_beams, key=lambda x: x[1], reverse=True)[:beam_size]
+
+        # Check if all beams have ended with EOS
+        if all_ended:
+            break
+
+    # Return the sequence from the beam with the highest score
+    best_seq, _ = beams[0]
+    return best_seq
+
+def top_k_sampling_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt, max_len, device, top_k):
+    sos_idx = tokenizer_tgt.token_to_id('[SOS]')
+    eos_idx = tokenizer_tgt.token_to_id('[EOS]')
+
+    encoder_output = model.encode(source, source_mask)
+    decoder_input = torch.empty(1, 1).fill_(sos_idx).type_as(source).to(device)
+
+    while True:
+        if decoder_input.size(1) == max_len:
+            break
+
+        decoder_mask = causal_mask(decoder_input.size(1)).type_as(source_mask).to(device)
+        decoder_output = model.decode(encoder_output, source_mask, decoder_input, decoder_mask)
+        
+        prob = model.project(decoder_output[:, -1])
+        
+        # Apply top-k sampling
+        top_k_probs, top_k_indices = torch.topk(prob, top_k, dim=-1)
+        
+        # Create a new distribution from the top-k probabilities
+        dist = torch.distributions.categorical.Categorical(logits=top_k_probs)
+        next_token_idx_in_top_k = dist.sample()
+        next_word = top_k_indices.gather(-1, next_token_idx_in_top_k.unsqueeze(-1)).squeeze(-1)
+
+        decoder_input = torch.cat([decoder_input, next_word.unsqueeze(0)], dim=1)
+
+        if next_word.item() == eos_idx:
+            break
+            
     return decoder_input.squeeze(0)

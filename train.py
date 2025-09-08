@@ -18,7 +18,7 @@ from utils import (
 )
 
 
-def run_validation(model, validation_dataset, tokenizer_src, tokenizer_tgt, max_len, device, print_msg, global_step, writer, num_examples=2 ):
+def run_evaluation(model, dataset, tokenizer_src, tokenizer_tgt, max_len, device, print_msg, global_step, writer, name, num_examples=2 ):
     model.eval()
     count = 0
 
@@ -29,12 +29,12 @@ def run_validation(model, validation_dataset, tokenizer_src, tokenizer_tgt, max_
     console_width = 80
 
     with torch.no_grad():
-        for batch in validation_dataset:
+        for batch in dataset:
             count += 1
             encoder_input = batch['encoder_input'].to(device)
             encoder_mask = batch['encoder_mask'].to(device)
 
-            assert encoder_input.size(0) == 1, "Batch size should be 1 for validation"
+            assert encoder_input.size(0) == 1, "Batch size should be 1 for evaluation"
             model_output = greedy_decode(model, encoder_input, encoder_mask, tokenizer_src, tokenizer_tgt, max_len, device)
 
             src_text = batch['src_text'][0]
@@ -45,29 +45,27 @@ def run_validation(model, validation_dataset, tokenizer_src, tokenizer_tgt, max_
             expected.append(tgt_text)
             predicted.append(model_output_text)
 
-            print_msg('-'*console_width)
-            print_msg(f"{f'SOURCE: ':>12}{src_text}")
-            print_msg(f"{f'TARGET: ':>12}{tgt_text}")
-            print_msg(f"{f'PREDICTED: ':>12}{model_output_text}")
-
-            if count == num_examples:
+            if count <= num_examples:
                 print_msg('-'*console_width)
-                break
-    
+                print_msg(f"--- {name.upper()} EXAMPLE {count} ---")
+                print_msg(f"{f'SOURCE: ':>12}{src_text}")
+                print_msg(f"{f'TARGET: ':>12}{tgt_text}")
+                print_msg(f"{f'PREDICTED: ':>12}{model_output_text}")
+
     if writer:
         metric = torchmetrics.CharErrorRate()
         cer = metric(predicted, expected)
-        writer.add_scalar('validation cer', cer, global_step)
+        writer.add_scalar(f'{name} cer', cer, global_step)
         writer.flush()
 
         metric = torchmetrics.WordErrorRate()
         wer = metric(predicted, expected)
-        writer.add_scalar('validation wer', wer, global_step)
+        writer.add_scalar(f'{name} wer', wer, global_step)
         writer.flush()
 
         metric = torchmetrics.BLEUScore()
         bleu = metric([p.lower() for p in predicted], [[e.lower()] for e in expected])
-        writer.add_scalar('validation BLEU', bleu, global_step)
+        writer.add_scalar(f'{name} BLEU', bleu, global_step)
         writer.flush()
 
 def get_dataset(config):
@@ -103,17 +101,21 @@ def get_dataset(config):
         and len(tokenizer_tgt.encode(item['translation'][config['lang_tgt']]).ids) <= config['seq_len'] - 1
     ]
     
-    train_ds_size = int(0.9 * len(filtered_data))
-    val_ds_size = len(filtered_data) - train_ds_size
-    train_ds_raw, val_ds_raw = random_split(filtered_data, [train_ds_size, val_ds_size])
+    # Split the dataset into train, validation, and test sets
+    train_ds_size = int(0.8 * len(filtered_data))
+    val_ds_size = int(0.1 * len(filtered_data))
+    test_ds_size = len(filtered_data) - train_ds_size - val_ds_size
+    train_ds_raw, val_ds_raw, test_ds_raw = random_split(filtered_data, [train_ds_size, val_ds_size, test_ds_size])
 
     train_dataset = BilingualDataset(train_ds_raw, tokenizer_src, tokenizer_tgt, config['lang_src'], config['lang_tgt'], config['seq_len'])
     validation_dataset = BilingualDataset(val_ds_raw, tokenizer_src, tokenizer_tgt, config['lang_src'], config['lang_tgt'], config['seq_len'])
+    test_dataset = BilingualDataset(test_ds_raw, tokenizer_src, tokenizer_tgt, config['lang_src'], config['lang_tgt'], config['seq_len'])
 
     train_dataloader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, drop_last=True)
     validation_dataloader = DataLoader(validation_dataset, batch_size=1, shuffle=True)
+    test_dataloader = DataLoader(test_dataset, batch_size=1, shuffle=True)
 
-    return train_dataloader, validation_dataloader, tokenizer_src, tokenizer_tgt
+    return train_dataloader, validation_dataloader, test_dataloader, tokenizer_src, tokenizer_tgt
 
 def get_model(config, vocab_src_len, vocab_tgt_len):
     model = build_transformer(
@@ -138,7 +140,7 @@ def train_model(config):
     # Make sure the model folder exists
     (base_path / config['model_folder']).mkdir(parents=True, exist_ok=True)
 
-    train_dataloader, validation_dataloader, tokenizer_src, tokenizer_tgt = get_dataset(config)
+    train_dataloader, validation_dataloader, test_dataloader, tokenizer_src, tokenizer_tgt = get_dataset(config)
     model = get_model(config, tokenizer_src.get_vocab_size(), tokenizer_tgt.get_vocab_size()).to(device)
     
     writer = SummaryWriter(config['experiment_name'])
@@ -183,7 +185,7 @@ def train_model(config):
 
             global_step += 1
         
-        run_validation(model, validation_dataloader, tokenizer_src, tokenizer_tgt, config['seq_len'], device, lambda msg: batch_iterator.write(msg), global_step, writer)
+        run_evaluation(model, validation_dataloader, tokenizer_src, tokenizer_tgt, config['seq_len'], device, lambda msg: batch_iterator.write(msg), global_step, writer, "validation")
 
         model_filename = get_weights_path(config, f'{epoch:02d}')
         torch.save({
@@ -192,6 +194,9 @@ def train_model(config):
             "optimizer_state_dict": optimizer.state_dict(),
             "global_step": global_step,
         }, model_filename)
+
+    # Final evaluation on the test set
+    run_evaluation(model, test_dataloader, tokenizer_src, tokenizer_tgt, config['seq_len'], device, print, 0, writer, "test")
 
 if __name__ == "__main__":
     warnings.filterwarnings("ignore")
