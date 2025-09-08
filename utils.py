@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 import math
+import json
+import random
 from pathlib import Path
 from torch.utils.data import Dataset
 from tokenizers import Tokenizer
@@ -17,7 +19,7 @@ def get_config():
         "lang_tgt": "en",
         "model_folder": "weights",
         "model_basename": "tmodel_",
-        "preload": None,
+        "preload": "06",
         "tokenizer_file": "tokenizer_{0}.json",
         "experiment_name": "runs/tmodel",
         "datasource": "local",
@@ -25,7 +27,6 @@ def get_config():
         "decoding_strategy": "greedy", # or "beam", "top-k"
         "beam_size": 5,
         "top_k": 3,
-        "gdrive_path": "/content/drive/MyDrive/translation_anlp/",
         "warmup_steps": 4000
     }
 
@@ -35,10 +36,6 @@ def get_weights_path(config, epoch: str):
     model_filename = f"{model_basename}{epoch}.pt"
     
     base_path = Path('.')
-    gdrive_path = config.get('gdrive_path')
-    if gdrive_path:
-        base_path = Path(gdrive_path)
-        
     return str(base_path / model_folder / model_filename)
 
 # From model.py (shared layers)
@@ -223,9 +220,6 @@ def get_all_sentences(config, language):
 
 def get_or_build_tokenizer(config, dataset, language):
     base_path = Path('.')
-    gdrive_path = config.get('gdrive_path')
-    if gdrive_path:
-        base_path = Path(gdrive_path)
     
     tokenizer_path = base_path / config['tokenizer_file'].format(language)
     
@@ -338,3 +332,149 @@ def top_k_sampling_decode(model, source, source_mask, tokenizer_src, tokenizer_t
             break
             
     return decoder_input.squeeze(0)
+
+def create_dataset_splits(config, force_recreate=False):
+    """
+    Create and save dataset splits (train/val/test) to ensure consistency across runs.
+    
+    Args:
+        config: Configuration dictionary
+        force_recreate: If True, recreate splits even if they exist
+    
+    Returns:
+        tuple: (train_indices, val_indices, test_indices)
+    """
+    splits_file = Path('./dataset_splits.json')
+    
+    # Check if splits already exist and we don't want to recreate
+    if splits_file.exists() and not force_recreate:
+        print(f"Loading existing dataset splits from {splits_file}")
+        with open(splits_file, 'r') as f:
+            splits_data = json.load(f)
+        return splits_data['train_indices'], splits_data['val_indices'], splits_data['test_indices']
+    
+    print("Creating new dataset splits...")
+    
+    # Load and filter the dataset (same logic as before)
+    src_lang = config['lang_src']
+    tgt_lang = config['lang_tgt']
+    data_path = Path('data')
+    src_path = data_path / f"EUbookshop.{src_lang}"
+    tgt_path = data_path / f"EUbookshop.{tgt_lang}"
+
+    with open(src_path, 'r', encoding='utf-8') as f:
+        src_lines = f.read().splitlines()
+    with open(tgt_path, 'r', encoding='utf-8') as f:
+        tgt_lines = f.read().splitlines()
+
+    # Create dataset in the expected format
+    dataset_raw = []
+    for src, tgt in zip(src_lines, tgt_lines):
+        dataset_raw.append({
+            'translation': {
+                src_lang: src,
+                tgt_lang: tgt
+            }
+        })
+
+    # Get tokenizers to filter by length
+    tokenizer_src = get_or_build_tokenizer(config, None, src_lang)
+    tokenizer_tgt = get_or_build_tokenizer(config, None, tgt_lang)
+
+    # Filter dataset by sequence length
+    filtered_indices = []
+    for i, item in enumerate(dataset_raw):
+        src_len = len(tokenizer_src.encode(item['translation'][config['lang_src']]).ids)
+        tgt_len = len(tokenizer_tgt.encode(item['translation'][config['lang_tgt']]).ids)
+        
+        if src_len <= config['seq_len'] - 2 and tgt_len <= config['seq_len'] - 1:
+            filtered_indices.append(i)
+    
+    # Set random seed for reproducible splits
+    random.seed(42)
+    random.shuffle(filtered_indices)
+    
+    # Calculate split sizes
+    total_size = len(filtered_indices)
+    train_size = int(0.8 * total_size)
+    val_size = int(0.1 * total_size)
+    test_size = total_size - train_size - val_size
+    
+    # Create splits
+    train_indices = filtered_indices[:train_size]
+    val_indices = filtered_indices[train_size:train_size + val_size]
+    test_indices = filtered_indices[train_size + val_size:]
+    
+    # Save splits to file
+    splits_data = {
+        'train_indices': train_indices,
+        'val_indices': val_indices,
+        'test_indices': test_indices,
+        'total_examples': total_size,
+        'train_size': len(train_indices),
+        'val_size': len(val_indices),
+        'test_size': len(test_indices),
+        'config_used': {
+            'seq_len': config['seq_len'],
+            'lang_src': config['lang_src'],
+            'lang_tgt': config['lang_tgt']
+        }
+    }
+    
+    with open(splits_file, 'w') as f:
+        json.dump(splits_data, f, indent=2)
+    
+    print(f"Dataset splits created and saved to {splits_file}")
+    print(f"Train: {len(train_indices)}, Val: {len(val_indices)}, Test: {len(test_indices)}")
+    
+    return train_indices, val_indices, test_indices
+
+def load_dataset_by_split(config, split_type='train'):
+    """
+    Load a specific split of the dataset.
+    
+    Args:
+        config: Configuration dictionary
+        split_type: 'train', 'val', or 'test'
+    
+    Returns:
+        list: Dataset items for the specified split
+    """
+    # Get the splits
+    train_indices, val_indices, test_indices = create_dataset_splits(config)
+    
+    # Choose the right indices based on split_type
+    if split_type == 'train':
+        indices = train_indices
+    elif split_type == 'val':
+        indices = val_indices
+    elif split_type == 'test':
+        indices = test_indices
+    else:
+        raise ValueError(f"Invalid split_type: {split_type}. Must be 'train', 'val', or 'test'")
+    
+    # Load the full dataset
+    src_lang = config['lang_src']
+    tgt_lang = config['lang_tgt']
+    data_path = Path('data')
+    src_path = data_path / f"EUbookshop.{src_lang}"
+    tgt_path = data_path / f"EUbookshop.{tgt_lang}"
+
+    with open(src_path, 'r', encoding='utf-8') as f:
+        src_lines = f.read().splitlines()
+    with open(tgt_path, 'r', encoding='utf-8') as f:
+        tgt_lines = f.read().splitlines()
+
+    # Create the full dataset
+    dataset_raw = []
+    for src, tgt in zip(src_lines, tgt_lines):
+        dataset_raw.append({
+            'translation': {
+                src_lang: src,
+                tgt_lang: tgt
+            }
+        })
+    
+    # Return only the items for this split
+    split_data = [dataset_raw[i] for i in indices]
+    return split_data

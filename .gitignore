@@ -2,5 +2,3 @@
 __pycache__/
 runs/
 weights/
-tokenizer_de.json
-tokenizer_en.json

@@ -1,13 +1,11 @@
 import torch
 import torch.nn as nn
-from torch.utils.data import random_split, DataLoader
-from datasets import load_dataset
+from torch.utils.data import DataLoader
 from pathlib import Path
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 import warnings
 import torchmetrics
-from datasets import load_dataset
 
 from model import build_transformer
 from utils import (
@@ -16,6 +14,7 @@ from utils import (
     get_or_build_tokenizer,
     BilingualDataset,
     greedy_decode,
+    load_dataset_by_split,
 )
 
 
@@ -70,51 +69,28 @@ def run_evaluation(model, dataset, tokenizer_src, tokenizer_tgt, max_len, device
         writer.flush()
 
 def get_dataset(config):
-    # Load the dataset from local files
-    src_lang = config['lang_src']
-    tgt_lang = config['lang_tgt']
-    data_path = Path('data')
-    src_path = data_path / f"EUbookshop.{src_lang}"
-    tgt_path = data_path / f"EUbookshop.{tgt_lang}"
+    # Load the pre-split datasets
+    train_data = load_dataset_by_split(config, 'train')
+    val_data = load_dataset_by_split(config, 'val')
+    test_data = load_dataset_by_split(config, 'test')
 
-    with open(src_path, 'r', encoding='utf-8') as f:
-        src_lines = f.read().splitlines()
-    with open(tgt_path, 'r', encoding='utf-8') as f:
-        tgt_lines = f.read().splitlines()
+    tokenizer_src = get_or_build_tokenizer(config, None, config['lang_src'])
+    tokenizer_tgt = get_or_build_tokenizer(config, None, config['lang_tgt'])
 
-    # Create a dataset in the expected format
-    dataset_raw = []
-    for src, tgt in zip(src_lines, tgt_lines):
-        dataset_raw.append({
-            'translation': {
-                src_lang: src,
-                tgt_lang: tgt
-            }
-        })
+    # Create dataset objects
+    train_dataset = BilingualDataset(train_data, tokenizer_src, tokenizer_tgt, config['lang_src'], config['lang_tgt'], config['seq_len'])
+    validation_dataset = BilingualDataset(val_data, tokenizer_src, tokenizer_tgt, config['lang_src'], config['lang_tgt'], config['seq_len'])
+    test_dataset = BilingualDataset(test_data, tokenizer_src, tokenizer_tgt, config['lang_src'], config['lang_tgt'], config['seq_len'])
 
-    tokenizer_src = get_or_build_tokenizer(config, None, src_lang)
-    tokenizer_tgt = get_or_build_tokenizer(config, None, tgt_lang)
-
-    # Filter and split the dataset
-    filtered_data = [
-        item for item in dataset_raw
-        if len(tokenizer_src.encode(item['translation'][config['lang_src']]).ids) <= config['seq_len'] - 2
-        and len(tokenizer_tgt.encode(item['translation'][config['lang_tgt']]).ids) <= config['seq_len'] - 1
-    ]
-    
-    # Split the dataset into train, validation, and test sets
-    train_ds_size = int(0.8 * len(filtered_data))
-    val_ds_size = int(0.1 * len(filtered_data))
-    test_ds_size = len(filtered_data) - train_ds_size - val_ds_size
-    train_ds_raw, val_ds_raw, test_ds_raw = random_split(filtered_data, [train_ds_size, val_ds_size, test_ds_size])
-
-    train_dataset = BilingualDataset(train_ds_raw, tokenizer_src, tokenizer_tgt, config['lang_src'], config['lang_tgt'], config['seq_len'])
-    validation_dataset = BilingualDataset(val_ds_raw, tokenizer_src, tokenizer_tgt, config['lang_src'], config['lang_tgt'], config['seq_len'])
-    test_dataset = BilingualDataset(test_ds_raw, tokenizer_src, tokenizer_tgt, config['lang_src'], config['lang_tgt'], config['seq_len'])
-
+    # Create data loaders
     train_dataloader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, drop_last=True)
-    validation_dataloader = DataLoader(validation_dataset, batch_size=1, shuffle=True)
-    test_dataloader = DataLoader(test_dataset, batch_size=1, shuffle=True)
+    validation_dataloader = DataLoader(validation_dataset, batch_size=1, shuffle=False)  # No shuffling for validation
+    test_dataloader = DataLoader(test_dataset, batch_size=1, shuffle=False)  # No shuffling for test
+
+    print(f"Dataset loaded with pre-defined splits:")
+    print(f"  Train: {len(train_dataset)} examples")
+    print(f"  Validation: {len(validation_dataset)} examples") 
+    print(f"  Test: {len(test_dataset)} examples")
 
     return train_dataloader, validation_dataloader, test_dataloader, tokenizer_src, tokenizer_tgt
 
@@ -134,9 +110,6 @@ def train_model(config):
 
     # Set up the base path for saving models and tokenizers
     base_path = Path('.')
-    gdrive_path = config.get('gdrive_path')
-    if gdrive_path:
-        base_path = Path(gdrive_path)
     
     # Make sure the model folder exists
     (base_path / config['model_folder']).mkdir(parents=True, exist_ok=True)
@@ -162,9 +135,6 @@ def train_model(config):
     else:
         # Auto-resume from latest checkpoint if available
         base_path = Path('.')
-        gdrive_path = config.get('gdrive_path')
-        if gdrive_path:
-            base_path = Path(gdrive_path)
         
         model_folder = base_path / config['model_folder']
         if model_folder.exists():
