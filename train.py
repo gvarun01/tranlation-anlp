@@ -75,6 +75,14 @@ def get_dataset(config):
     val_data = load_dataset_by_split(config, 'val')
     test_data = load_dataset_by_split(config, 'test')
 
+    # Use tiny subset for debugging if specified
+    if config.get('tiny_subset', False):
+        print("Using tiny subset for debugging...")
+        train_data = train_data[:100]  # Use only 100 examples for training
+        val_data = val_data[:50]       # Use only 50 examples for validation
+        test_data = test_data[:50]     # Use only 50 examples for testing
+        print(f"Tiny subset - Train: {len(train_data)}, Val: {len(val_data)}, Test: {len(test_data)}")
+
     tokenizer_src = get_or_build_tokenizer(config, None, config['lang_src'])
     tokenizer_tgt = get_or_build_tokenizer(config, None, config['lang_tgt'])
 
@@ -199,6 +207,7 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=10**-4, help="Learning rate")
     parser.add_argument("--seq_len", type=int, default=150, help="Sequence length")
     parser.add_argument("--d_model", type=int, default=512, help="Model dimension")
+    parser.add_argument("--tiny_subset", action="store_true", help="Use tiny subset (100 train, 50 val, 50 test) for debugging")
     
     args = parser.parse_args()
     
@@ -211,5 +220,6 @@ if __name__ == "__main__":
     config['lr'] = args.lr
     config['seq_len'] = args.seq_len
     config['d_model'] = args.d_model
+    config['tiny_subset'] = args.tiny_subset
     
     train_model(config)

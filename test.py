@@ -28,6 +28,12 @@ def get_test_dataset(config):
     # Load the pre-split test data
     test_data = load_dataset_by_split(config, 'test')
 
+    # Use tiny subset for debugging if specified
+    if config.get('tiny_subset', False):
+        print("Using tiny subset for testing...")
+        test_data = test_data[:50]  # Use only 50 examples for testing
+        print(f"Tiny subset - Test: {len(test_data)} examples")
+
     # Load tokenizers
     tokenizer_src_path = Path(config['tokenizer_file'].format(config['lang_src']))
     tokenizer_tgt_path = Path(config['tokenizer_file'].format(config['lang_tgt']))
@@ -310,11 +316,13 @@ if __name__ == "__main__":
     parser.add_argument("sentence", nargs='?', help="Sentence to translate (if not evaluating)")
     parser.add_argument("--evaluate", action="store_true", help="Run evaluation instead of translation")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size for evaluation")
+    parser.add_argument("--tiny_subset", action="store_true", help="Use tiny subset for testing (same as training)")
     
     args = parser.parse_args()
     
     config = get_config()
     config['batch_size'] = args.batch_size
+    config['tiny_subset'] = args.tiny_subset
     
     if args.evaluate:
         evaluate_model(args.epoch_number, config)
@@ -322,8 +330,8 @@ if __name__ == "__main__":
         translate(args.epoch_number, args.sentence, config)
     else:
         print("Usage:")
-        print("  Translation: python test.py <epoch_number> <sentence_to_translate> [--batch_size BATCH_SIZE]")
-        print("  Evaluation:  python test.py <epoch_number> --evaluate [--batch_size BATCH_SIZE]")
+        print("  Translation: python test.py <epoch_number> <sentence_to_translate> [--batch_size BATCH_SIZE] [--tiny_subset]")
+        print("  Evaluation:  python test.py <epoch_number> --evaluate [--batch_size BATCH_SIZE] [--tiny_subset]")
         print("Examples:")
         print("  python test.py 1 'Tämä on testivirke.' --batch_size 16")
-        print("  python test.py 4 --evaluate --batch_size 32")
+        print("  python test.py 4 --evaluate --batch_size 32 --tiny_subset")
