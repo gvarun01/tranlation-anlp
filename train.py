@@ -21,7 +21,22 @@ from utils import (
 )
 
 
-def run_evaluation(model, dataset, tokenizer_src, tokenizer_tgt, max_len, device, print_msg, global_step, writer, name, num_examples=2, loss_fn=None):
+def run_evaluation(
+    model,
+    dataset,
+    tokenizer_src,
+    tokenizer_tgt,
+    max_len,
+    device,
+    print_msg,
+    global_step,
+    writer,
+    name,
+    num_examples=2,
+    loss_fn=None,
+    max_batches=None,
+    compute_metrics=True,
+):
     model.eval()
     count = 0
     total_loss = 0.0
@@ -52,24 +67,26 @@ def run_evaluation(model, dataset, tokenizer_src, tokenizer_tgt, max_len, device
                 total_loss += loss.item()
                 num_batches += 1
 
-            # Greedy decode for metrics
-            assert encoder_input.size(0) == 1, "Batch size should be 1 for evaluation"
-            model_output = greedy_decode(model, encoder_input, encoder_mask, tokenizer_src, tokenizer_tgt, max_len, device)
+            # Greedy decode for metrics (optional)
+            if compute_metrics:
+                if encoder_input.size(0) == 1:
+                    model_output = greedy_decode(model, encoder_input, encoder_mask, tokenizer_src, tokenizer_tgt, max_len, device)
+                    src_text = batch['src_text'][0]
+                    tgt_text = batch['tgt_text'][0]
+                    model_output_text = tokenizer_tgt.decode(model_output.detach().cpu().numpy())
+                    source_texts.append(src_text)
+                    expected.append(tgt_text)
+                    predicted.append(model_output_text)
+                    if count <= num_examples:
+                        print_msg('-'*console_width)
+                        print_msg(f"--- {name.upper()} EXAMPLE {count} ---")
+                        print_msg(f"{f'SOURCE: ':>12}{src_text}")
+                        print_msg(f"{f'TARGET: ':>12}{tgt_text}")
+                        print_msg(f"{f'PREDICTED: ':>12}{model_output_text}")
 
-            src_text = batch['src_text'][0]
-            tgt_text = batch['tgt_text'][0]
-            model_output_text = tokenizer_tgt.decode(model_output.detach().cpu().numpy())
-
-            source_texts.append(src_text)
-            expected.append(tgt_text)
-            predicted.append(model_output_text)
-
-            if count <= num_examples:
-                print_msg('-'*console_width)
-                print_msg(f"--- {name.upper()} EXAMPLE {count} ---")
-                print_msg(f"{f'SOURCE: ':>12}{src_text}")
-                print_msg(f"{f'TARGET: ':>12}{tgt_text}")
-                print_msg(f"{f'PREDICTED: ':>12}{model_output_text}")
+            # Respect max_batches limit
+            if max_batches is not None and num_batches >= max_batches:
+                break
 
     # Compute metrics
     cer = None
@@ -77,7 +94,7 @@ def run_evaluation(model, dataset, tokenizer_src, tokenizer_tgt, max_len, device
     bleu = None
     val_loss = None
     
-    if len(predicted) > 0:
+    if compute_metrics and len(predicted) > 0:
         metric = torchmetrics.CharErrorRate()
         cer = metric(predicted, expected)
         if writer:
@@ -286,7 +303,8 @@ def train_model(config):
     best_val_loss = None
     best_model_path = None
     patience_counter = 0
-    early_stopping_patience = config.get('early_stopping_patience', 5)
+    # Clamp patience to at least 1 to avoid immediate stop
+    early_stopping_patience = max(1, config.get('early_stopping_patience', 5))
     gradient_accumulation_steps = config.get('gradient_accumulation_steps', 1)
     
     print(f"Training with gradient accumulation steps: {gradient_accumulation_steps}")
@@ -358,38 +376,49 @@ def train_model(config):
         # Validation evaluation at epoch end (only if frequency allows)
         val_eval_frequency = config.get('val_eval_frequency', 1)
         if epoch % val_eval_frequency == 0 or epoch == config['num_epochs'] - 1:
-            val_metrics = run_evaluation(model, validation_dataloader, tokenizer_src, tokenizer_tgt, config['seq_len'], device, lambda *args, **kwargs: None, global_step, writer, "val", num_examples=0, loss_fn=loss_fn)
+            # Quick validation - only compute loss, no expensive metrics
+            val_metrics = run_evaluation(
+                model,
+                validation_dataloader,
+                tokenizer_src,
+                tokenizer_tgt,
+                config['seq_len'],
+                device,
+                lambda *args, **kwargs: None,
+                global_step,
+                writer,
+                "val",
+                num_examples=0,
+                loss_fn=loss_fn,
+                max_batches=config.get('val_max_batches', 50),  # More batches for better loss estimate
+                compute_metrics=False,  # Skip BLEU/WER/CER for speed
+            )
             current_bleu = val_metrics.get('bleu') if val_metrics else None
             current_loss = val_metrics.get('loss') if val_metrics else None
+            print(f"Validation metrics — BLEU: {current_bleu}, Loss: {current_loss}")
             
-            # Track best model by BLEU (primary) and loss (secondary)
+            # Track best model by loss only (since we disabled BLEU for speed)
             improved = False
-            if current_bleu is not None:
-                if best_val_bleu is None or current_bleu > best_val_bleu:
-                    best_val_bleu = current_bleu
-                    improved = True
-                    print(f"New best BLEU: {best_val_bleu:.4f} at epoch {epoch:02d}")
-                elif current_loss is not None and best_val_loss is not None and current_loss < best_val_loss and current_bleu >= best_val_bleu * 0.99:  # Within 1% of best BLEU
-                    best_val_loss = current_loss
-                    improved = True
-                    print(f"New best loss: {best_val_loss:.4f} at epoch {epoch:02d}")
-            
             if current_loss is not None:
                 if best_val_loss is None:
                     best_val_loss = current_loss
+                    improved = True
+                    print(f"Initial validation loss: {best_val_loss:.4f} at epoch {epoch:02d}")
                 elif current_loss < best_val_loss:
                     best_val_loss = current_loss
+                    improved = True
+                    print(f"New best validation loss: {best_val_loss:.4f} at epoch {epoch:02d}")
             
-            # Early stopping check
-            if improved:
-                patience_counter = 0
-            else:
-                patience_counter += 1
-                print(f"No improvement for {patience_counter} epochs (patience: {early_stopping_patience})")
-                
-                if patience_counter >= early_stopping_patience:
-                    print(f"Early stopping triggered at epoch {epoch:02d}")
-                    break
+            # Early stopping check (only if we have valid loss)
+            if current_loss is not None:
+                if improved:
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                    print(f"No improvement for {patience_counter} epochs (patience: {early_stopping_patience})")
+                    if patience_counter >= early_stopping_patience:
+                        print(f"Early stopping triggered at epoch {epoch:02d}")
+                        break
 
         # Save model checkpoint (only if frequency allows)
         save_frequency = config.get('save_frequency', 1)
@@ -412,8 +441,8 @@ def train_model(config):
                 "val_loss": current_loss,
             }, model_filename)
 
-            # Save best model if improved
-            if improved and current_bleu is not None:
+            # Save best model if improved (based on loss since BLEU is disabled)
+            if improved and current_loss is not None:
                 best_model_path = get_weights_path(config, 'best')
                 torch.save({
                     "epoch": epoch,
@@ -451,6 +480,8 @@ if __name__ == "__main__":
     parser.add_argument("--save_frequency", type=int, default=1, help="Save checkpoint every N epochs")
     parser.add_argument("--positional_encoding", type=str, default="rope", choices=["rope", "relative"], help="Positional encoding type")
     parser.add_argument("--num_workers", type=int, default=4, help="Number of data loading workers")
+    parser.add_argument("--val_max_batches", type=int, default=16, help="Max validation batches (None for all)")
+    parser.add_argument("--val_compute_metrics", action="store_true", help="Compute validation metrics (BLEU/WER/CER)")
     
     args = parser.parse_args()
     
@@ -472,5 +503,7 @@ if __name__ == "__main__":
     config['save_frequency'] = args.save_frequency
     config['positional_encoding'] = args.positional_encoding
     config['num_workers'] = args.num_workers
+    config['val_max_batches'] = None if args.val_max_batches is None else args.val_max_batches
+    config['val_compute_metrics'] = args.val_compute_metrics
     
     train_model(config)
