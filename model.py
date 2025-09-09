@@ -8,6 +8,7 @@ from utils import (
     MultiHeadAttentionBlock,
     FeedForwardBlock,
     ProjectionLayer,
+    RelativePositionBias,
 )
 
 class Transformer(nn.Module):
@@ -30,24 +31,25 @@ class Transformer(nn.Module):
     def project(self, x):
         return self.projection_layer(x)
 
-def build_transformer(src_vocab_size: int, tgt_vocab_size: int, src_seq_len: int, tgt_seq_len: int, d_model: int=512, N: int=6, h: int=8, dropout: float=0.1, d_ff: int=2048) -> Transformer:
+def build_transformer(src_vocab_size: int, tgt_vocab_size: int, src_seq_len: int, tgt_seq_len: int, d_model: int=512, N: int=6, h: int=8, dropout: float=0.1, d_ff: int=2048, positional_encoding: str = "rope") -> Transformer:
     src_embed = InputEmbeddings(d_model, src_vocab_size)
     tgt_embed = InputEmbeddings(d_model, tgt_vocab_size)
-
-    # Create the rotary positional embedding layer
-    rope = RotaryPositionalEmbedding(d_model // h, max_seq_len=max(src_seq_len, tgt_seq_len))
+    use_rope = positional_encoding == "rope"
+    use_relative = positional_encoding == "relative"
+    rope = RotaryPositionalEmbedding(d_model // h, max_seq_len=max(src_seq_len, tgt_seq_len)) if use_rope else None
+    rel_bias = RelativePositionBias(num_heads=h) if use_relative else None
     
     encoder_blocks = []
     for _ in range(N):
-        encoder_self_attention_block = MultiHeadAttentionBlock(d_model, h, dropout, rope)
+        encoder_self_attention_block = MultiHeadAttentionBlock(d_model, h, dropout, rope, rel_bias)
         feed_forward_block = FeedForwardBlock(d_model, d_ff, dropout)
         encoder_block = EncoderBlock(d_model, encoder_self_attention_block, feed_forward_block, dropout)
         encoder_blocks.append(encoder_block)
 
     decoder_blocks = []
     for _ in range(N):
-        decoder_self_attention_block = MultiHeadAttentionBlock(d_model, h, dropout, rope)
-        decoder_cross_attention_block = MultiHeadAttentionBlock(d_model, h, dropout, rope=None) # No RoPE for cross-attention
+        decoder_self_attention_block = MultiHeadAttentionBlock(d_model, h, dropout, rope, rel_bias)
+        decoder_cross_attention_block = MultiHeadAttentionBlock(d_model, h, dropout, rope=None, attn_bias_module=None) # No positional bias for cross-attention
         feed_forward_block = FeedForwardBlock(d_model, d_ff, dropout)
         decoder_block = DecoderBlock(d_model, decoder_self_attention_block, decoder_cross_attention_block, feed_forward_block, dropout)
         decoder_blocks.append(decoder_block)

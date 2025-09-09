@@ -35,7 +35,13 @@ def get_config():
         "decoding_strategy": "greedy", # or "beam", "top-k"
         "beam_size": 5,
         "top_k": 3,
-        "warmup_steps": 4000
+        "warmup_steps": 2000,
+        "early_stopping_patience": 5,  # Stop if no improvement for N epochs
+        "gradient_accumulation_steps": 1,  # Accumulate gradients over N steps
+        "use_amp": True,  # Use automatic mixed precision
+        "compile_model": True,  # Use torch.compile for speed
+        "val_eval_frequency": 1,  # Evaluate validation every N epochs
+        "save_frequency": 1  # Save checkpoint every N epochs
     }
 
 def get_weights_path(config, epoch: str):
@@ -83,14 +89,20 @@ def find_latest_checkpoint(config):
 def get_checkpoint_path_for_epoch(config, epoch_number):
     """
     Get checkpoint path for a specific epoch. Searches in working directory first, then Kaggle input.
+    Special case: 'best' loads tmodel_best.pt
     """
     model_basename = config['model_basename']
-    try:
-        epoch_str = f"{int(epoch_number):02d}"
-    except ValueError:
-        print(f"Invalid epoch number: {epoch_number}. Expected an integer.")
-        return None
-    checkpoint_filename = f"{model_basename}{epoch_str}.pt"
+    
+    # Special case for 'best' model
+    if epoch_number == 'best':
+        checkpoint_filename = f"{model_basename}best.pt"
+    else:
+        try:
+            epoch_str = f"{int(epoch_number):02d}"
+        except ValueError:
+            print(f"Invalid epoch number: {epoch_number}. Expected an integer or 'best'.")
+            return None
+        checkpoint_filename = f"{model_basename}{epoch_str}.pt"
     
     # Check local working directory first
     local_path = Path('.') / config['model_folder'] / checkpoint_filename
@@ -148,40 +160,28 @@ class RotaryPositionalEmbedding(nn.Module):
         self.dim = dim
         inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
         t = torch.arange(max_seq_len, dtype=inv_freq.dtype)
-        freqs = torch.einsum("i,j->ij", t, inv_freq)
-        # Different from paper, but it uses a different permutation in order to obtain the same calculation
-        emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos", emb.cos())
-        self.register_buffer("sin", emb.sin())
+        freqs = torch.einsum("i,j->ij", t, inv_freq)  # (max_seq_len, dim/2)
+        cos = freqs.cos()
+        sin = freqs.sin()
+        # Interleave to match even/odd dims
+        cos = torch.stack([cos, cos], dim=-1).reshape(max_seq_len, dim)
+        sin = torch.stack([sin, sin], dim=-1).reshape(max_seq_len, dim)
+        self.register_buffer("cos", cos)
+        self.register_buffer("sin", sin)
+
+    @staticmethod
+    def rotate_half(x: torch.Tensor) -> torch.Tensor:
+        x1 = x[..., ::2]
+        x2 = x[..., 1::2]
+        x_rot = torch.stack((-x2, x1), dim=-1)
+        return x_rot.flatten(-2)
 
     def forward(self, x: torch.Tensor):
         # x: (batch, h, seq_len, d_k)
-        batch_size, num_heads, seq_len, d_k = x.shape
-        
-        # Get cos and sin for the sequence length and feature dimension
-        cos = self.cos[:seq_len, :d_k]  # (seq_len, d_k)
-        sin = self.sin[:seq_len, :d_k]  # (seq_len, d_k)
-        
-        # Reshape cos and sin to match x dimensions: (1, 1, seq_len, d_k)
-        cos = cos.unsqueeze(0).unsqueeze(0)  # (1, 1, seq_len, d_k)
-        sin = sin.unsqueeze(0).unsqueeze(0)  # (1, 1, seq_len, d_k)
-        
-        # Reshape x to apply rotation to pairs of features: (..., d_k//2, 2)
-        x_reshaped = x.reshape(batch_size, num_heads, seq_len, d_k // 2, 2)
-        cos_reshaped = cos.reshape(1, 1, seq_len, d_k // 2, 2)
-        sin_reshaped = sin.reshape(1, 1, seq_len, d_k // 2, 2)
-        
-        # Apply rotary transformation
-        x_rotated = torch.stack(
-            [
-                x_reshaped[..., 0] * cos_reshaped[..., 0] - x_reshaped[..., 1] * sin_reshaped[..., 0],
-                x_reshaped[..., 0] * sin_reshaped[..., 1] + x_reshaped[..., 1] * cos_reshaped[..., 1],
-            ],
-            dim=-1,
-        )
-        
-        # Reshape back to original dimensions
-        return x_rotated.reshape(batch_size, num_heads, seq_len, d_k)
+        seq_len = x.shape[-2]
+        cos = self.cos[:seq_len, :].unsqueeze(0).unsqueeze(0)  # (1,1,seq_len,dim)
+        sin = self.sin[:seq_len, :].unsqueeze(0).unsqueeze(0)
+        return (x * cos) + (self.rotate_half(x) * sin)
 
 class ResidualConnection(nn.Module):
     def __init__(self, features: int, dropout: float) -> None:
@@ -193,7 +193,7 @@ class ResidualConnection(nn.Module):
         return x + self.dropout(sublayer(self.norm(x)))
 
 class MultiHeadAttentionBlock(nn.Module):
-    def __init__(self, d_model: int, h: int, dropout: float, rope: RotaryPositionalEmbedding = None) -> None:
+    def __init__(self, d_model: int, h: int, dropout: float, rope: RotaryPositionalEmbedding = None, attn_bias_module: nn.Module = None) -> None:
         super().__init__()
         self.d_model = d_model
         self.h = h
@@ -205,13 +205,16 @@ class MultiHeadAttentionBlock(nn.Module):
         self.w_o = nn.Linear(d_model, d_model, bias=False)
         self.dropout = nn.Dropout(dropout)
         self.rope = rope
+        self.attn_bias_module = attn_bias_module
 
     @staticmethod
-    def attention(query, key, value, mask, dropout: nn.Dropout):
+    def attention(query, key, value, mask, dropout: nn.Dropout, bias: torch.Tensor = None):
         d_k = query.shape[-1]
         attention_scores = (query @ key.transpose(-2, -1)) / math.sqrt(d_k)
         if mask is not None:
             attention_scores.masked_fill_(mask == 0, -1e9)
+        if bias is not None:
+            attention_scores = attention_scores + bias
         attention_scores = attention_scores.softmax(dim=-1)
         if dropout is not None:
             attention_scores = dropout(attention_scores)
@@ -230,7 +233,15 @@ class MultiHeadAttentionBlock(nn.Module):
             query = self.rope(query)
             key = self.rope(key)
 
-        x, self.attention_scores = MultiHeadAttentionBlock.attention(query, key, value, mask, self.dropout)
+        # Compute relative position bias if configured
+        bias = None
+        if self.attn_bias_module is not None:
+            # mask shape can be (batch, 1, Lq, Lk) or (batch, Lq) & causal elsewhere; we only need lengths
+            Lq = query.shape[-2]
+            Lk = key.shape[-2]
+            bias = self.attn_bias_module(Lq, Lk)  # (1, h, Lq, Lk)
+
+        x, self.attention_scores = MultiHeadAttentionBlock.attention(query, key, value, mask, self.dropout, bias)
         x = x.transpose(1, 2).contiguous().view(x.shape[0], -1, self.h * self.d_k)
         return self.w_o(x)
 
@@ -242,43 +253,51 @@ class ProjectionLayer(nn.Module):
     def forward(self, x) -> None:
         return self.proj(x)
 
-# From dataset.py
-class BilingualDataset(Dataset):
-    def __init__(self, dataset, tokenizer_src, tokenizer_tgt, src_lang, tgt_lang, seq_len):
+class RelativePositionBias(nn.Module):
+    """
+    T5/Shaw-style relative position bias producing an additive attention bias per head.
+    """
+    def __init__(self, num_heads: int, num_buckets: int = 32, max_distance: int = 128) -> None:
         super().__init__()
-        self.dataset = dataset
-        self.tokenizer_src = tokenizer_src
-        self.tokenizer_tgt = tokenizer_tgt
-        self.src_lang = src_lang
-        self.tgt_lang = tgt_lang
-        self.seq_len = seq_len
-        self.sos_token = torch.tensor([tokenizer_tgt.token_to_id("[SOS]")], dtype=torch.int64)
-        self.eos_token = torch.tensor([tokenizer_tgt.token_to_id("[EOS]")], dtype=torch.int64)
-        self.pad_token = torch.tensor([tokenizer_tgt.token_to_id("[PAD]")], dtype=torch.int64)
+        self.num_heads = num_heads
+        self.num_buckets = num_buckets
+        self.max_distance = max_distance
+        self.relative_attention_bias = nn.Embedding(num_buckets, num_heads)
 
-    def __len__(self):
-        return len(self.dataset)
+    def _relative_position_bucket(self, relative_position: torch.Tensor) -> torch.Tensor:
+        # T5-style signed buckets
+        num_buckets = self.num_buckets
+        max_distance = self.max_distance
+        n = -relative_position
+        sign = (n > 0).to(torch.long)
+        half = num_buckets // 2
+        n = n.abs()
+        # exact for small positions
+        is_small = n < half
+        val_if_small = n
+        # logarithmic buckets for larger positions
+        # avoid log(0)
+        n_clamped = torch.clamp(n, min=1)
+        log_ratio = torch.log(n_clamped.float() / half) / math.log(max_distance / half)
+        val_if_large = (log_ratio * (num_buckets - half)).floor().to(torch.long) + half
+        val_if_large = torch.clamp(val_if_large, max=num_buckets - 1)
+        val = torch.where(is_small, val_if_small, val_if_large)
+        # fold sign: first half for negative, second half for positive
+        return val + sign * half
 
-    def __getitem__(self, idx):
-        src_tgt_pair = self.dataset[idx]
-        src_text = src_tgt_pair['translation'][self.src_lang]
-        tgt_text = src_tgt_pair['translation'][self.tgt_lang]
-        src_tokens = self.tokenizer_src.encode(src_text).ids
-        tgt_tokens = self.tokenizer_tgt.encode(tgt_text).ids
-        enc_pad_len = self.seq_len - len(src_tokens) - 2
-        dec_pad_len = self.seq_len - len(tgt_tokens) - 1
-        if enc_pad_len < 0 or dec_pad_len < 0:
-            raise ValueError("Sentence is too long")
-        encoder_input = torch.cat([self.sos_token, torch.tensor(src_tokens, dtype=torch.int64), self.eos_token, torch.tensor([self.pad_token] * enc_pad_len, dtype=torch.int64)], dim=0)
-        decoder_input = torch.cat([self.sos_token, torch.tensor(tgt_tokens, dtype=torch.int64), torch.tensor([self.pad_token] * dec_pad_len, dtype=torch.int64)], dim=0)
-        label = torch.cat([torch.tensor(tgt_tokens, dtype=torch.int64), self.eos_token, torch.tensor([self.pad_token] * dec_pad_len, dtype=torch.int64)], dim=0)
-        assert encoder_input.size(0) == self.seq_len
-        assert decoder_input.size(0) == self.seq_len
-        assert label.size(0) == self.seq_len
-        return {"encoder_input": encoder_input, "decoder_input": decoder_input, "encoder_mask": (encoder_input != self.pad_token).unsqueeze(0).unsqueeze(0).int(), "decoder_mask": (decoder_input != self.pad_token).unsqueeze(0).int() & causal_mask(decoder_input.size(0)), "label": label, "src_text": src_text, "tgt_text": tgt_text}
+    def forward(self, q_len: int, k_len: int) -> torch.Tensor:
+        context_position = torch.arange(q_len)[:, None]
+        memory_position = torch.arange(k_len)[None, :]
+        relative_position = memory_position - context_position  # (q_len, k_len)
+        rp_bucket = self._relative_position_bucket(relative_position)
+        # (q_len, k_len, num_heads)
+        values = self.relative_attention_bias(rp_bucket)
+        values = values.permute(2, 0, 1).unsqueeze(0)  # (1, num_heads, q_len, k_len)
+        return values
 
-def causal_mask(size):
-    mask = torch.triu(torch.ones((1, size, size)), diagonal=1).type(torch.int)
+# From dataset.py
+def causal_mask(size, device=None):
+    mask = torch.triu(torch.ones((1, size, size), device=device), diagonal=1).type(torch.int)
     return mask == 0
 
 # From train.py (helpers)
@@ -320,7 +339,7 @@ def greedy_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt, max_
     while True:
         if decoder_input.size(1) == max_len:
             break
-        decoder_mask = causal_mask(decoder_input.size(1)).type_as(source_mask).to(device)
+        decoder_mask = causal_mask(decoder_input.size(1), device=device).type_as(source_mask).to(device)
         decoder_output = model_module.decode(encoder_output, source_mask, decoder_input, decoder_mask)
         prob = model_module.project(decoder_output[:, -1])
         _, next_word = torch.max(prob, dim=1)
@@ -350,7 +369,7 @@ def beam_search_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt,
             all_ended = False
 
             decoder_input = seq.unsqueeze(0)
-            decoder_mask = causal_mask(decoder_input.size(1)).type_as(source_mask).to(device)
+            decoder_mask = causal_mask(decoder_input.size(1), device=device).type_as(source_mask).to(device)
             
             decoder_output = model_module.decode(encoder_output, source_mask, decoder_input, decoder_mask)
             
@@ -387,7 +406,7 @@ def top_k_sampling_decode(model, source, source_mask, tokenizer_src, tokenizer_t
         if decoder_input.size(1) == max_len:
             break
 
-        decoder_mask = causal_mask(decoder_input.size(1)).type_as(source_mask).to(device)
+        decoder_mask = causal_mask(decoder_input.size(1), device=device).type_as(source_mask).to(device)
         decoder_output = model_module.decode(encoder_output, source_mask, decoder_input, decoder_mask)
         
         prob = model_module.project(decoder_output[:, -1])
@@ -553,12 +572,12 @@ def load_dataset_by_split(config, split_type='train'):
     split_data = [dataset_raw[i] for i in indices]
     return split_data
 
-def causal_mask(size):
-    mask = torch.triu(torch.ones((1, size, size)), diagonal=1).type(torch.int)
+def causal_mask(size, device=None):
+    mask = torch.triu(torch.ones((1, size, size), device=device), diagonal=1).type(torch.int)
     return mask == 0
 
 class BilingualDataset(Dataset):
-    def __init__(self, ds, tokenizer_src, tokenizer_tgt, src_lang, tgt_lang, seq_len):
+    def __init__(self, ds, tokenizer_src, tokenizer_tgt, src_lang, tgt_lang, seq_len, device=None):
         super().__init__()
         self.ds = ds
         self.tokenizer_src = tokenizer_src
@@ -566,10 +585,17 @@ class BilingualDataset(Dataset):
         self.src_lang = src_lang
         self.tgt_lang = tgt_lang
         self.seq_len = seq_len
+        self.device = device
 
-        self.sos_token = torch.tensor([tokenizer_src.token_to_id('[SOS]')], dtype=torch.int64)
-        self.eos_token = torch.tensor([tokenizer_src.token_to_id('[EOS]')], dtype=torch.int64)
-        self.pad_token = torch.tensor([tokenizer_src.token_to_id('[PAD]')], dtype=torch.int64)
+        # Source language specials (for encoder side)
+        self.sos_src = torch.tensor([tokenizer_src.token_to_id('[SOS]')], dtype=torch.int64, device=device)
+        self.eos_src = torch.tensor([tokenizer_src.token_to_id('[EOS]')], dtype=torch.int64, device=device)
+        self.pad_src = torch.tensor([tokenizer_src.token_to_id('[PAD]')], dtype=torch.int64, device=device)
+
+        # Target language specials (for decoder side and labels)
+        self.sos_tgt = torch.tensor([tokenizer_tgt.token_to_id('[SOS]')], dtype=torch.int64, device=device)
+        self.eos_tgt = torch.tensor([tokenizer_tgt.token_to_id('[EOS]')], dtype=torch.int64, device=device)
+        self.pad_tgt = torch.tensor([tokenizer_tgt.token_to_id('[PAD]')], dtype=torch.int64, device=device)
 
     def __len__(self):
         return len(self.ds)
@@ -595,10 +621,10 @@ class BilingualDataset(Dataset):
         # Add <s> and </s> token
         encoder_input = torch.cat(
             [
-                self.sos_token,
+                self.sos_src,
                 torch.tensor(enc_input_tokens, dtype=torch.int64),
-                self.eos_token,
-                torch.tensor([self.pad_token] * enc_num_padding_tokens, dtype=torch.int64),
+                self.eos_src,
+                torch.tensor([self.pad_src] * enc_num_padding_tokens, dtype=torch.int64),
             ],
             dim=0,
         )
@@ -606,9 +632,9 @@ class BilingualDataset(Dataset):
         # Add only <s> token
         decoder_input = torch.cat(
             [
-                self.sos_token,
+                self.sos_tgt,
                 torch.tensor(dec_input_tokens, dtype=torch.int64),
-                torch.tensor([self.pad_token] * dec_num_padding_tokens, dtype=torch.int64),
+                torch.tensor([self.pad_tgt] * dec_num_padding_tokens, dtype=torch.int64),
             ],
             dim=0,
         )
@@ -617,8 +643,8 @@ class BilingualDataset(Dataset):
         label = torch.cat(
             [
                 torch.tensor(dec_input_tokens, dtype=torch.int64),
-                self.eos_token,
-                torch.tensor([self.pad_token] * dec_num_padding_tokens, dtype=torch.int64),
+                self.eos_tgt,
+                torch.tensor([self.pad_tgt] * dec_num_padding_tokens, dtype=torch.int64),
             ],
             dim=0,
         )
@@ -631,8 +657,8 @@ class BilingualDataset(Dataset):
         return {
             "encoder_input": encoder_input,  # (seq_len)
             "decoder_input": decoder_input,  # (seq_len)
-            "encoder_mask": (encoder_input != self.pad_token).unsqueeze(0).unsqueeze(0).int(), # (1, 1, seq_len)
-            "decoder_mask": (decoder_input != self.pad_token).unsqueeze(0).int() & causal_mask(decoder_input.size(0)), # (1, seq_len) & (1, seq_len, seq_len),
+            "encoder_mask": (encoder_input != self.pad_src).unsqueeze(0).unsqueeze(0).int(), # (1, 1, seq_len)
+            "decoder_mask": (decoder_input != self.pad_tgt).unsqueeze(0).int() & causal_mask(decoder_input.size(0), device=None), # (1, seq_len) & (1, seq_len, seq_len),
             "label": label,  # (seq_len)
             "src_text": src_text,
             "tgt_text": tgt_text,

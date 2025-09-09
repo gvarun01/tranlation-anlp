@@ -36,7 +36,7 @@ def get_test_dataset(config):
     tokenizer_tgt = Tokenizer.from_file(str(tokenizer_tgt_path))
 
     # Create test dataset and dataloader
-    test_dataset = BilingualDataset(test_data, tokenizer_src, tokenizer_tgt, config['lang_src'], config['lang_tgt'], config['seq_len'])
+    test_dataset = BilingualDataset(test_data, tokenizer_src, tokenizer_tgt, config['lang_src'], config['lang_tgt'], config['seq_len'], device=None)  # CPU for data loading
     # Use multiple workers for faster data loading
     test_dataloader = DataLoader(test_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=4)
 
@@ -84,7 +84,8 @@ def evaluate_model(epoch_number: str, config):
         N=config['N'],
         h=config['h'],
         dropout=config['dropout'],
-        d_ff=config['d_ff']
+        d_ff=config['d_ff'],
+        positional_encoding=config.get('positional_encoding', 'rope')
     )
     
     # Wrap model with DataParallel if multiple GPUs are available
@@ -183,24 +184,29 @@ def evaluate_model(epoch_number: str, config):
             encoder_input = batch['encoder_input'].to(device)  # (batch_size, seq_len)
             encoder_mask = batch['encoder_mask'].to(device)    # (batch_size, 1, seq_len, seq_len)
 
-            # Greedy Decode (batched)
-            outputs_greedy = [greedy_decode(model, encoder_input[i:i+1], encoder_mask[i:i+1], tokenizer_src, tokenizer_tgt, config['seq_len'], device) for i in range(encoder_input.size(0))]
-            # Beam Search Decode (batched)
-            outputs_beam = [beam_search_decode(model, encoder_input[i:i+1], encoder_mask[i:i+1], tokenizer_src, tokenizer_tgt, config['seq_len'], device, config['beam_size']) for i in range(encoder_input.size(0))]
-            # Top-k Sampling Decode (batched)
-            outputs_top_k = [top_k_sampling_decode(model, encoder_input[i:i+1], encoder_mask[i:i+1], tokenizer_src, tokenizer_tgt, config['seq_len'], device, config['top_k']) for i in range(encoder_input.size(0))]
+            outputs_greedy = []
+            outputs_beam = []
+            outputs_top_k = []
+            if config.get('strategy', 'all') in ['greedy', 'all']:
+                outputs_greedy = [greedy_decode(model, encoder_input[i:i+1], encoder_mask[i:i+1], tokenizer_src, tokenizer_tgt, config['seq_len'], device) for i in range(encoder_input.size(0))]
+            if config.get('strategy', 'all') in ['beam', 'all']:
+                outputs_beam = [beam_search_decode(model, encoder_input[i:i+1], encoder_mask[i:i+1], tokenizer_src, tokenizer_tgt, config['seq_len'], device, config['beam_size']) for i in range(encoder_input.size(0))]
+            if config.get('strategy', 'all') in ['topk', 'all']:
+                outputs_top_k = [top_k_sampling_decode(model, encoder_input[i:i+1], encoder_mask[i:i+1], tokenizer_src, tokenizer_tgt, config['seq_len'], device, config['top_k']) for i in range(encoder_input.size(0))]
 
             tgt_texts = batch['tgt_text']
             expected.extend(tgt_texts)
 
             # Decode all predictions
-            model_output_texts_greedy = [tokenizer_tgt.decode(output.detach().cpu().numpy()) for output in outputs_greedy]
-            model_output_texts_beam = [tokenizer_tgt.decode(output.detach().cpu().numpy()) for output in outputs_beam]
-            model_output_texts_top_k = [tokenizer_tgt.decode(output.detach().cpu().numpy()) for output in outputs_top_k]
-
-            predicted_greedy.extend(model_output_texts_greedy)
-            predicted_beam.extend(model_output_texts_beam)
-            predicted_top_k.extend(model_output_texts_top_k)
+            if outputs_greedy:
+                model_output_texts_greedy = [tokenizer_tgt.decode(output.detach().cpu().numpy()) for output in outputs_greedy]
+                predicted_greedy.extend(model_output_texts_greedy)
+            if outputs_beam:
+                model_output_texts_beam = [tokenizer_tgt.decode(output.detach().cpu().numpy()) for output in outputs_beam]
+                predicted_beam.extend(model_output_texts_beam)
+            if outputs_top_k:
+                model_output_texts_top_k = [tokenizer_tgt.decode(output.detach().cpu().numpy()) for output in outputs_top_k]
+                predicted_top_k.extend(model_output_texts_top_k)
 
     # Save predictions and expected translations to files
     output_dir = Path("results")
@@ -211,20 +217,26 @@ def evaluate_model(epoch_number: str, config):
     pred_filepath_top_k = output_dir / f"predictions_top_k_epoch_{epoch_number}.txt"
     exp_filepath = output_dir / f"expected_epoch_{epoch_number}.txt"
 
-    with open(pred_filepath_greedy, "w", encoding="utf-8") as f:
-        f.write("\n".join(predicted_greedy))
-    with open(pred_filepath_beam, "w", encoding="utf-8") as f:
-        f.write("\n".join(predicted_beam))
-    with open(pred_filepath_top_k, "w", encoding="utf-8") as f:
-        f.write("\n".join(predicted_top_k))
+    if predicted_greedy:
+        with open(pred_filepath_greedy, "w", encoding="utf-8") as f:
+            f.write("\n".join(predicted_greedy))
+    if predicted_beam:
+        with open(pred_filepath_beam, "w", encoding="utf-8") as f:
+            f.write("\n".join(predicted_beam))
+    if predicted_top_k:
+        with open(pred_filepath_top_k, "w", encoding="utf-8") as f:
+            f.write("\n".join(predicted_top_k))
     
     with open(exp_filepath, "w", encoding="utf-8") as f:
         f.write("\n".join(expected))
         
     print(f"Predictions saved to:")
-    print(f"  Greedy: {pred_filepath_greedy}")
-    print(f"  Beam:   {pred_filepath_beam}")
-    print(f"  Top-k:  {pred_filepath_top_k}")
+    if predicted_greedy:
+        print(f"  Greedy: {pred_filepath_greedy}")
+    if predicted_beam:
+        print(f"  Beam:   {pred_filepath_beam}")
+    if predicted_top_k:
+        print(f"  Top-k:  {pred_filepath_top_k}")
     print(f"Expected: {exp_filepath}")
 
     print("=" * 50)
@@ -232,27 +244,28 @@ def evaluate_model(epoch_number: str, config):
     print("=" * 50)
 
     if metrics_available:
-        # Calculate BLEU and BERTScore for all decoding methods
-        print("\n--- GREEDY DECODING ---")
-        bleu_greedy = bleu_metric([p.lower() for p in predicted_greedy], [[e.lower()] for e in expected])
-        print(f"BLEU Score:      {bleu_greedy:.4f}")
-        P, R, F1 = bert_scorer.score(predicted_greedy, expected)
-        bert_f1_greedy = F1.mean()
-        print(f"BERTScore (F1):  {bert_f1_greedy:.4f}")
-
-        print("\n--- BEAM SEARCH DECODING ---")
-        bleu_beam = bleu_metric([p.lower() for p in predicted_beam], [[e.lower()] for e in expected])
-        print(f"BLEU Score:      {bleu_beam:.4f}")
-        P, R, F1 = bert_scorer.score(predicted_beam, expected)
-        bert_f1_beam = F1.mean()
-        print(f"BERTScore (F1):  {bert_f1_beam:.4f}")
-
-        print("\n--- TOP-K SAMPLING DECODING ---")
-        bleu_top_k = bleu_metric([p.lower() for p in predicted_top_k], [[e.lower()] for e in expected])
-        print(f"BLEU Score:      {bleu_top_k:.4f}")
-        P, R, F1 = bert_scorer.score(predicted_top_k, expected)
-        bert_f1_top_k = F1.mean()
-        print(f"BERTScore (F1):  {bert_f1_top_k:.4f}")
+        # Calculate BLEU and BERTScore for selected decoding methods
+        if predicted_greedy:
+            print("\n--- GREEDY DECODING ---")
+            bleu_greedy = bleu_metric([p.lower() for p in predicted_greedy], [[e.lower()] for e in expected])
+            print(f"BLEU Score:      {bleu_greedy:.4f}")
+            P, R, F1 = bert_scorer.score(predicted_greedy, expected)
+            bert_f1_greedy = F1.mean()
+            print(f"BERTScore (F1):  {bert_f1_greedy:.4f}")
+        if predicted_beam:
+            print("\n--- BEAM SEARCH DECODING ---")
+            bleu_beam = bleu_metric([p.lower() for p in predicted_beam], [[e.lower()] for e in expected])
+            print(f"BLEU Score:      {bleu_beam:.4f}")
+            P, R, F1 = bert_scorer.score(predicted_beam, expected)
+            bert_f1_beam = F1.mean()
+            print(f"BERTScore (F1):  {bert_f1_beam:.4f}")
+        if predicted_top_k:
+            print("\n--- TOP-K SAMPLING DECODING ---")
+            bleu_top_k = bleu_metric([p.lower() for p in predicted_top_k], [[e.lower()] for e in expected])
+            print(f"BLEU Score:      {bleu_top_k:.4f}")
+            P, R, F1 = bert_scorer.score(predicted_top_k, expected)
+            bert_f1_top_k = F1.mean()
+            print(f"BERTScore (F1):  {bert_f1_top_k:.4f}")
         
         print("\n" + "=" * 50)
     else:
@@ -309,7 +322,8 @@ def translate(epoch_number: str, sentence: str, config):
         N=config['N'],
         h=config['h'],
         dropout=config['dropout'],
-        d_ff=config['d_ff']
+        d_ff=config['d_ff'],
+        positional_encoding=config.get('positional_encoding', 'rope')
     )
     
     # Wrap model with DataParallel if multiple GPUs are available
@@ -430,12 +444,16 @@ if __name__ == "__main__":
     parser.add_argument("--evaluate", action="store_true", help="Run evaluation instead of translation")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size for evaluation")
     parser.add_argument("--gpus", type=int, default=None, help="Number of GPUs to use (default: all available)")
+    parser.add_argument("--strategy", choices=["greedy", "beam", "topk", "all"], default="all", help="Decoding strategy for translation/evaluation")
+    parser.add_argument("--positional_encoding", type=str, default="rope", choices=["rope", "relative"], help="Positional encoding type")
     
     args = parser.parse_args()
     
     config = get_config()
     config['batch_size'] = args.batch_size
     config['num_gpus'] = args.gpus
+    config['strategy'] = args.strategy
+    config['positional_encoding'] = args.positional_encoding
     
     if args.evaluate:
         evaluate_model(args.epoch_number, config)

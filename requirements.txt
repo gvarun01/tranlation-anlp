@@ -4,3 +4,4 @@ tqdm
 datasets
 tokenizers
 altair
+bert-score
