@@ -118,7 +118,9 @@ def evaluate_model(epoch_number: str, config):
     print(f"Evaluating model on {len(test_dataloader)} test examples...")
     
     model.eval()
-    predicted = []
+    predicted_greedy = []
+    predicted_beam = []
+    predicted_top_k = []
     expected = []
 
     # Setup metrics
@@ -139,63 +141,102 @@ def evaluate_model(epoch_number: str, config):
             encoder_mask = batch['encoder_mask'].to(device)    # Shape: (batch_size, 1, seq_len, seq_len)
             
             batch_size = encoder_input.size(0)
-            model_outputs = []
+            batch_greedy = []
+            batch_beam = []
+            batch_top_k = []
             
             # Process each example in the batch individually
             for i in range(batch_size):
                 single_encoder_input = encoder_input[i:i+1]  # Shape: (1, seq_len)
                 single_encoder_mask = encoder_mask[i:i+1]    # Shape: (1, 1, seq_len, seq_len)
                 
-                # Use greedy decoding for each example
-                output = greedy_decode(model, single_encoder_input, single_encoder_mask, tokenizer_src, tokenizer_tgt, config['seq_len'], device)
-                model_outputs.append(output)
+                # Greedy Decode
+                output_greedy = greedy_decode(model, single_encoder_input, single_encoder_mask, tokenizer_src, tokenizer_tgt, config['seq_len'], device)
+                batch_greedy.append(output_greedy)
+                
+                # Beam Search Decode
+                output_beam = beam_search_decode(model, single_encoder_input, single_encoder_mask, tokenizer_src, tokenizer_tgt, config['seq_len'], device, config['beam_size'])
+                batch_beam.append(output_beam)
+                
+                # Top-k Sampling Decode
+                output_top_k = top_k_sampling_decode(model, single_encoder_input, single_encoder_mask, tokenizer_src, tokenizer_tgt, config['seq_len'], device, config['top_k'])
+                batch_top_k.append(output_top_k)
             
             tgt_texts = batch['tgt_text']
-            model_output_texts = [tokenizer_tgt.decode(output.detach().cpu().numpy()) for output in model_outputs]
-
             expected.extend(tgt_texts)
-            predicted.extend(model_output_texts)
+            
+            # Decode all predictions
+            model_output_texts_greedy = [tokenizer_tgt.decode(output.detach().cpu().numpy()) for output in batch_greedy]
+            model_output_texts_beam = [tokenizer_tgt.decode(output.detach().cpu().numpy()) for output in batch_beam]
+            model_output_texts_top_k = [tokenizer_tgt.decode(output.detach().cpu().numpy()) for output in batch_top_k]
+            
+            predicted_greedy.extend(model_output_texts_greedy)
+            predicted_beam.extend(model_output_texts_beam)
+            predicted_top_k.extend(model_output_texts_top_k)
 
     # Save predictions and expected translations to files
     output_dir = Path("results")
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    pred_filepath = output_dir / f"predictions_epoch_{epoch_number}.txt"
+    pred_filepath_greedy = output_dir / f"predictions_greedy_epoch_{epoch_number}.txt"
+    pred_filepath_beam = output_dir / f"predictions_beam_epoch_{epoch_number}.txt"
+    pred_filepath_top_k = output_dir / f"predictions_top_k_epoch_{epoch_number}.txt"
     exp_filepath = output_dir / f"expected_epoch_{epoch_number}.txt"
 
-    with open(pred_filepath, "w", encoding="utf-8") as f:
-        f.write("\n".join(predicted))
+    with open(pred_filepath_greedy, "w", encoding="utf-8") as f:
+        f.write("\n".join(predicted_greedy))
+    with open(pred_filepath_beam, "w", encoding="utf-8") as f:
+        f.write("\n".join(predicted_beam))
+    with open(pred_filepath_top_k, "w", encoding="utf-8") as f:
+        f.write("\n".join(predicted_top_k))
     
     with open(exp_filepath, "w", encoding="utf-8") as f:
         f.write("\n".join(expected))
         
-    print(f"Predictions saved to {pred_filepath}")
-    print(f"Expected translations saved to {exp_filepath}")
+    print(f"Predictions saved to:")
+    print(f"  Greedy: {pred_filepath_greedy}")
+    print(f"  Beam:   {pred_filepath_beam}")
+    print(f"  Top-k:  {pred_filepath_top_k}")
+    print(f"Expected: {exp_filepath}")
 
     print("=" * 50)
     print(f"EVALUATION RESULTS FOR EPOCH {epoch_number}")
     print("=" * 50)
 
     if metrics_available:
-        # Calculate BLEU score
-        bleu = bleu_metric([p.lower() for p in predicted], [[e.lower()] for e in expected])
-        print(f"BLEU Score:      {bleu:.4f}")
+        # Calculate BLEU and BERTScore for all decoding methods
+        print("\n--- GREEDY DECODING ---")
+        bleu_greedy = bleu_metric([p.lower() for p in predicted_greedy], [[e.lower()] for e in expected])
+        print(f"BLEU Score:      {bleu_greedy:.4f}")
+        P, R, F1 = bert_scorer.score(predicted_greedy, expected)
+        bert_f1_greedy = F1.mean()
+        print(f"BERTScore (F1):  {bert_f1_greedy:.4f}")
 
-        # Calculate BERTScore
-        P, R, F1 = bert_scorer.score(predicted, expected)
-        bert_f1_score = F1.mean()
-        print(f"BERTScore (F1):  {bert_f1_score:.4f}")
-        print("=" * 50)
+        print("\n--- BEAM SEARCH DECODING ---")
+        bleu_beam = bleu_metric([p.lower() for p in predicted_beam], [[e.lower()] for e in expected])
+        print(f"BLEU Score:      {bleu_beam:.4f}")
+        P, R, F1 = bert_scorer.score(predicted_beam, expected)
+        bert_f1_beam = F1.mean()
+        print(f"BERTScore (F1):  {bert_f1_beam:.4f}")
+
+        print("\n--- TOP-K SAMPLING DECODING ---")
+        bleu_top_k = bleu_metric([p.lower() for p in predicted_top_k], [[e.lower()] for e in expected])
+        print(f"BLEU Score:      {bleu_top_k:.4f}")
+        P, R, F1 = bert_scorer.score(predicted_top_k, expected)
+        bert_f1_top_k = F1.mean()
+        print(f"BERTScore (F1):  {bert_f1_top_k:.4f}")
+        
+        print("\n" + "=" * 50)
     else:
         print("Metrics not available, showing sample predictions only.")
         print("=" * 50)
         
-    # Show a few examples
-    print("\nSample translations:")
+    # Show a few examples from greedy decoding
+    print("\nSample translations (Greedy decoding):")
     print("-" * 50)
-    for i in range(min(5, len(predicted))):
+    for i in range(min(5, len(predicted_greedy))):
         print(f"Expected:  {expected[i]}")
-        print(f"Predicted: {predicted[i]}")
+        print(f"Predicted: {predicted_greedy[i]}")
         print("-" * 50)
 
 def translate(epoch_number: str, sentence: str, config):
