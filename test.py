@@ -37,11 +37,12 @@ def get_test_dataset(config):
 
     # Create test dataset and dataloader
     test_dataset = BilingualDataset(test_data, tokenizer_src, tokenizer_tgt, config['lang_src'], config['lang_tgt'], config['seq_len'])
-    test_dataloader = DataLoader(test_dataset, batch_size=config['batch_size'], shuffle=False)
+    # Use multiple workers for faster data loading
+    test_dataloader = DataLoader(test_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=4)
 
     print(f"Test dataset loaded: {len(test_dataset)} examples")
 
-    return test_dataloader, tokenizer_src, tokenizer_tgt
+    return test_dataloader, tokenizer_src, tokenizer_tgt, len(test_dataset)
 
 def evaluate_model(epoch_number: str, config):
     """Evaluate the model on the test set and calculate BLEU score"""
@@ -150,11 +151,15 @@ def evaluate_model(epoch_number: str, config):
         
         sys.exit(1)
 
-    # Get test dataset
-    test_dataloader, _, _ = get_test_dataset(config)
-    
-    print(f"Evaluating model on {len(test_dataloader)} test examples...")
-    
+    # Get test dataset and true number of examples
+    test_dataloader, tokenizer_src, tokenizer_tgt, num_test_examples = get_test_dataset(config)
+
+    print(f"Evaluating model on {num_test_examples} test examples...")
+
+    # Warn if batch size is too small for multi-GPU
+    if num_gpus > 1 and config['batch_size'] < num_gpus:
+        print(f"Warning: Batch size ({config['batch_size']}) is less than number of GPUs ({num_gpus}). Increase batch size for better GPU utilization.")
+
     model.eval()
     predicted_greedy = []
     predicted_beam = []
@@ -175,39 +180,24 @@ def evaluate_model(epoch_number: str, config):
 
     with torch.no_grad():
         for batch in tqdm(test_dataloader, desc="Evaluating"):
-            encoder_input = batch['encoder_input'].to(device)  # Shape: (batch_size, seq_len)
-            encoder_mask = batch['encoder_mask'].to(device)    # Shape: (batch_size, 1, seq_len, seq_len)
-            
-            batch_size = encoder_input.size(0)
-            batch_greedy = []
-            batch_beam = []
-            batch_top_k = []
-            
-            # Process each example in the batch individually
-            for i in range(batch_size):
-                single_encoder_input = encoder_input[i:i+1]  # Shape: (1, seq_len)
-                single_encoder_mask = encoder_mask[i:i+1]    # Shape: (1, 1, seq_len, seq_len)
-                
-                # Greedy Decode
-                output_greedy = greedy_decode(model, single_encoder_input, single_encoder_mask, tokenizer_src, tokenizer_tgt, config['seq_len'], device)
-                batch_greedy.append(output_greedy)
-                
-                # Beam Search Decode
-                output_beam = beam_search_decode(model, single_encoder_input, single_encoder_mask, tokenizer_src, tokenizer_tgt, config['seq_len'], device, config['beam_size'])
-                batch_beam.append(output_beam)
-                
-                # Top-k Sampling Decode
-                output_top_k = top_k_sampling_decode(model, single_encoder_input, single_encoder_mask, tokenizer_src, tokenizer_tgt, config['seq_len'], device, config['top_k'])
-                batch_top_k.append(output_top_k)
-            
+            encoder_input = batch['encoder_input'].to(device)  # (batch_size, seq_len)
+            encoder_mask = batch['encoder_mask'].to(device)    # (batch_size, 1, seq_len, seq_len)
+
+            # Greedy Decode (batched)
+            outputs_greedy = [greedy_decode(model, encoder_input[i:i+1], encoder_mask[i:i+1], tokenizer_src, tokenizer_tgt, config['seq_len'], device) for i in range(encoder_input.size(0))]
+            # Beam Search Decode (batched)
+            outputs_beam = [beam_search_decode(model, encoder_input[i:i+1], encoder_mask[i:i+1], tokenizer_src, tokenizer_tgt, config['seq_len'], device, config['beam_size']) for i in range(encoder_input.size(0))]
+            # Top-k Sampling Decode (batched)
+            outputs_top_k = [top_k_sampling_decode(model, encoder_input[i:i+1], encoder_mask[i:i+1], tokenizer_src, tokenizer_tgt, config['seq_len'], device, config['top_k']) for i in range(encoder_input.size(0))]
+
             tgt_texts = batch['tgt_text']
             expected.extend(tgt_texts)
-            
+
             # Decode all predictions
-            model_output_texts_greedy = [tokenizer_tgt.decode(output.detach().cpu().numpy()) for output in batch_greedy]
-            model_output_texts_beam = [tokenizer_tgt.decode(output.detach().cpu().numpy()) for output in batch_beam]
-            model_output_texts_top_k = [tokenizer_tgt.decode(output.detach().cpu().numpy()) for output in batch_top_k]
-            
+            model_output_texts_greedy = [tokenizer_tgt.decode(output.detach().cpu().numpy()) for output in outputs_greedy]
+            model_output_texts_beam = [tokenizer_tgt.decode(output.detach().cpu().numpy()) for output in outputs_beam]
+            model_output_texts_top_k = [tokenizer_tgt.decode(output.detach().cpu().numpy()) for output in outputs_top_k]
+
             predicted_greedy.extend(model_output_texts_greedy)
             predicted_beam.extend(model_output_texts_beam)
             predicted_top_k.extend(model_output_texts_top_k)
