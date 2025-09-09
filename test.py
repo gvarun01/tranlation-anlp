@@ -198,7 +198,7 @@ def evaluate_model(epoch_number: str, config):
         for batch in tqdm(test_dataloader, desc="Evaluating"):
             encoder_input = batch['encoder_input'].to(device)  # (batch_size, seq_len)
             encoder_mask = batch['encoder_mask'].to(device)    # (batch_size, 1, seq_len, seq_len)
-            expected_texts = batch['label_text']  # List of expected texts
+            expected_texts = batch['tgt_text']  # List of expected texts
 
             batch_size = encoder_input.size(0)
             
