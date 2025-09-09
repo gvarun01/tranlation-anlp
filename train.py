@@ -201,14 +201,15 @@ def train_model(config):
     if num_gpus > 1:
         model = torch.nn.DataParallel(model)
         print(f"Model wrapped with DataParallel using {num_gpus} GPUs")
-        
-        # Debug multi-GPU setup
+    
+    model = model.to(device)
+    
+    # Debug multi-GPU setup (after model is on device)
+    if num_gpus > 1:
         print(f"DataParallel device_ids: {list(range(num_gpus))}")
         print(f"Model device: {next(model.parameters()).device}")
         print(f"Available GPUs: {[torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]}")
         print(f"CUDA memory per GPU: {[torch.cuda.get_device_properties(i).total_memory // 1024**3 for i in range(torch.cuda.device_count())]} GB")
-    
-    model = model.to(device)
     
     writer = SummaryWriter(config['experiment_name'])
     
@@ -216,6 +217,10 @@ def train_model(config):
     effective_lr = config['lr'] * num_gpus if num_gpus > 1 else config['lr']
     optimizer = torch.optim.Adam(model.parameters(), lr=effective_lr, betas=(0.9, 0.98), eps=1e-9)
     print(f"Effective learning rate: {effective_lr}")
+    
+    # Get DataLoader configuration for logging
+    num_workers = min(4, config.get('num_workers', 4))
+    pin_memory = torch.cuda.is_available()
     print(f"DataLoader workers: {num_workers}, Pin memory: {pin_memory}")
 
     initial_epoch = 0
