@@ -176,6 +176,11 @@ def evaluate_model(epoch_number: str, config):
     predicted_beam = []
     predicted_top_k = []
     expected = []
+    
+    # Progress tracking and optional subset limiting
+    total_batches = len(test_dataloader)
+    processed_samples = 0
+    max_test_samples = config.get('max_test_samples', None)
 
     # Setup metrics
     try:
@@ -194,20 +199,38 @@ def evaluate_model(epoch_number: str, config):
             encoder_input = batch['encoder_input'].to(device)  # (batch_size, seq_len)
             encoder_mask = batch['encoder_mask'].to(device)    # (batch_size, 1, seq_len, seq_len)
 
+            # Process batch more efficiently
+            batch_size = encoder_input.size(0)
             outputs_greedy = []
             outputs_beam = []
             outputs_top_k = []
-            if config.get('strategy', 'all') in ['greedy', 'all']:
-                outputs_greedy = [greedy_decode(model, encoder_input[i:i+1], encoder_mask[i:i+1], tokenizer_src, tokenizer_tgt, config['seq_len'], device) for i in range(encoder_input.size(0))]
-            if config.get('strategy', 'all') in ['beam', 'all']:
-                outputs_beam = [beam_search_decode(model, encoder_input[i:i+1], encoder_mask[i:i+1], tokenizer_src, tokenizer_tgt, config['seq_len'], device, config['beam_size']) for i in range(encoder_input.size(0))]
-            if config.get('strategy', 'all') in ['topk', 'all']:
-                outputs_top_k = [top_k_sampling_decode(model, encoder_input[i:i+1], encoder_mask[i:i+1], tokenizer_src, tokenizer_tgt, config['seq_len'], device, config['top_k']) for i in range(encoder_input.size(0))]
+            
+            # Process each sample in the batch
+            for i in range(batch_size):
+                try:
+                    if config.get('strategy', 'all') in ['greedy', 'all']:
+                        greedy_out = greedy_decode(model, encoder_input[i:i+1], encoder_mask[i:i+1], tokenizer_src, tokenizer_tgt, config['seq_len'], device)
+                        outputs_greedy.append(greedy_out)
+                    if config.get('strategy', 'all') in ['beam', 'all']:
+                        beam_out = beam_search_decode(model, encoder_input[i:i+1], encoder_mask[i:i+1], tokenizer_src, tokenizer_tgt, config['seq_len'], device, config['beam_size'])
+                        outputs_beam.append(beam_out)
+                    if config.get('strategy', 'all') in ['topk', 'all']:
+                        topk_out = top_k_sampling_decode(model, encoder_input[i:i+1], encoder_mask[i:i+1], tokenizer_src, tokenizer_tgt, config['seq_len'], device, config['top_k'])
+                        outputs_top_k.append(topk_out)
+                except Exception as e:
+                    print(f"Warning: Decoding failed for sample {i}: {e}")
+                    # Add empty output to maintain alignment
+                    if config.get('strategy', 'all') in ['greedy', 'all']:
+                        outputs_greedy.append(torch.tensor([tokenizer_tgt.token_to_id('[PAD]')], device=device))
+                    if config.get('strategy', 'all') in ['beam', 'all']:
+                        outputs_beam.append(torch.tensor([tokenizer_tgt.token_to_id('[PAD]')], device=device))
+                    if config.get('strategy', 'all') in ['topk', 'all']:
+                        outputs_top_k.append(torch.tensor([tokenizer_tgt.token_to_id('[PAD]')], device=device))
 
             tgt_texts = batch['tgt_text']
             expected.extend(tgt_texts)
 
-            # Decode all predictions
+            # Decode all predictions and extend lists
             if outputs_greedy:
                 model_output_texts_greedy = [tokenizer_tgt.decode(output.detach().cpu().numpy()) for output in outputs_greedy]
                 predicted_greedy.extend(model_output_texts_greedy)
@@ -217,6 +240,14 @@ def evaluate_model(epoch_number: str, config):
             if outputs_top_k:
                 model_output_texts_top_k = [tokenizer_tgt.decode(output.detach().cpu().numpy()) for output in outputs_top_k]
                 predicted_top_k.extend(model_output_texts_top_k)
+            
+            # Update progress and optionally stop early
+            processed_samples += batch_size
+            if processed_samples % 100 == 0:
+                print(f"Processed {processed_samples}/{num_test_examples} samples...")
+            if (max_test_samples is not None) and (processed_samples >= max_test_samples):
+                print(f"Stopping early after {processed_samples} samples (--max_test_samples).")
+                break
 
     # Save predictions and expected translations to files
     output_dir = Path("results")
@@ -457,6 +488,7 @@ if __name__ == "__main__":
     parser.add_argument("--strategy", choices=["greedy", "beam", "topk", "all"], default="all", help="Decoding strategy for translation/evaluation")
     parser.add_argument("--positional_encoding", type=str, default="rope", choices=["rope", "relative"], help="Positional encoding type")
     parser.add_argument("--num_workers", type=int, default=4, help="Number of data loading workers")
+    parser.add_argument("--max_test_samples", type=int, default=None, help="Limit evaluation to first N samples (for quick runs)")
     
     args = parser.parse_args()
     
@@ -466,6 +498,7 @@ if __name__ == "__main__":
     config['strategy'] = args.strategy
     config['positional_encoding'] = args.positional_encoding
     config['num_workers'] = args.num_workers
+    config['max_test_samples'] = args.max_test_samples
     
     if args.evaluate:
         evaluate_model(args.epoch_number, config)
