@@ -242,7 +242,9 @@ class MultiHeadAttentionBlock(nn.Module):
             # mask shape can be (batch, 1, Lq, Lk) or (batch, Lq) & causal elsewhere; we only need lengths
             Lq = query.shape[-2]
             Lk = key.shape[-2]
-            bias = self.attn_bias_module(Lq, Lk)  # (1, h, Lq, Lk)
+            # Disable AMP for relative position bias computation to avoid indexing issues
+            with torch.cuda.amp.autocast(enabled=False):
+                bias = self.attn_bias_module(Lq, Lk)  # (1, h, Lq, Lk)
 
         x, self.attention_scores = MultiHeadAttentionBlock.attention(query, key, value, mask, self.dropout, bias)
         x = x.transpose(1, 2).contiguous().view(x.shape[0], -1, self.h * self.d_k)
@@ -286,7 +288,10 @@ class RelativePositionBias(nn.Module):
         val_if_large = torch.clamp(val_if_large, max=num_buckets - 1)
         val = torch.where(is_small, val_if_small, val_if_large)
         # fold sign: first half for negative, second half for positive
-        return val + sign * half
+        result = val + sign * half
+        # Ensure all values are within bounds
+        result = torch.clamp(result, 0, num_buckets - 1)
+        return result
 
     def forward(self, q_len: int, k_len: int) -> torch.Tensor:
         device = self.relative_attention_bias.weight.device
@@ -294,6 +299,13 @@ class RelativePositionBias(nn.Module):
         memory_position = torch.arange(k_len, device=device)[None, :]
         relative_position = memory_position - context_position  # (q_len, k_len)
         rp_bucket = self._relative_position_bucket(relative_position)
+        
+        # Debug: Check for out-of-bounds indices
+        if torch.any(rp_bucket < 0) or torch.any(rp_bucket >= self.num_buckets):
+            print(f"Warning: Out-of-bounds indices in relative position bias!")
+            print(f"Min: {rp_bucket.min()}, Max: {rp_bucket.max()}, Expected range: [0, {self.num_buckets-1}]")
+            rp_bucket = torch.clamp(rp_bucket, 0, self.num_buckets - 1)
+        
         # (q_len, k_len, num_heads)
         values = self.relative_attention_bias(rp_bucket)
         values = values.permute(2, 0, 1).unsqueeze(0)  # (1, num_heads, q_len, k_len)

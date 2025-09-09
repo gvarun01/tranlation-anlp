@@ -271,6 +271,10 @@ def train_model(config):
 
     # Initialize mixed precision scaler
     scaler = torch.cuda.amp.GradScaler() if config.get('use_amp', False) and torch.cuda.is_available() else None
+    if scaler is not None:
+        print("Using Automatic Mixed Precision (AMP)")
+    else:
+        print("Not using AMP")
     
     # Compile model for speed if enabled
     if config.get('compile_model', False) and hasattr(torch, 'compile'):
