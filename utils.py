@@ -212,9 +212,12 @@ class MultiHeadAttentionBlock(nn.Module):
         d_k = query.shape[-1]
         attention_scores = (query @ key.transpose(-2, -1)) / math.sqrt(d_k)
         if mask is not None:
-            attention_scores.masked_fill_(mask == 0, -1e9)
+            # Use dtype-aware minimum to avoid fp16 overflow on masked_fill
+            fill_value = torch.finfo(attention_scores.dtype).min
+            attention_scores.masked_fill_(mask == 0, fill_value)
         if bias is not None:
-            attention_scores = attention_scores + bias
+            # Ensure bias matches device and dtype
+            attention_scores = attention_scores + bias.to(device=attention_scores.device, dtype=attention_scores.dtype)
         attention_scores = attention_scores.softmax(dim=-1)
         if dropout is not None:
             attention_scores = dropout(attention_scores)
@@ -286,8 +289,9 @@ class RelativePositionBias(nn.Module):
         return val + sign * half
 
     def forward(self, q_len: int, k_len: int) -> torch.Tensor:
-        context_position = torch.arange(q_len)[:, None]
-        memory_position = torch.arange(k_len)[None, :]
+        device = self.relative_attention_bias.weight.device
+        context_position = torch.arange(q_len, device=device)[:, None]
+        memory_position = torch.arange(k_len, device=device)[None, :]
         relative_position = memory_position - context_position  # (q_len, k_len)
         rp_bucket = self._relative_position_bucket(relative_position)
         # (q_len, k_len, num_heads)
