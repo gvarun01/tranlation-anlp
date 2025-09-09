@@ -16,6 +16,7 @@ from utils import (
     BilingualDataset,
     greedy_decode,
     load_dataset_by_split,
+    get_model_module,
 )
 
 
@@ -202,9 +203,10 @@ def train_model(config):
             encoder_mask = batch['encoder_mask'].to(device)
             decoder_mask = batch['decoder_mask'].to(device)
 
-            encoder_output = model.encode(encoder_input, encoder_mask)
-            decoder_output = model.decode(encoder_output, encoder_mask, decoder_input, decoder_mask)
-            proj_output = model.project(decoder_output)
+            model_module = get_model_module(model)
+            encoder_output = model_module.encode(encoder_input, encoder_mask)
+            decoder_output = model_module.decode(encoder_output, encoder_mask, decoder_input, decoder_mask)
+            proj_output = model_module.project(decoder_output)
 
             label = batch['label'].to(device)
             loss = loss_fn(proj_output.view(-1, tokenizer_tgt.get_vocab_size()), label.view(-1))

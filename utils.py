@@ -7,6 +7,10 @@ from pathlib import Path
 from torch.utils.data import Dataset
 from tokenizers import Tokenizer
 
+def get_model_module(model):
+    """Helper function to get the model module, handling DataParallel wrapper"""
+    return model.module if hasattr(model, 'module') else model
+
 # From config.py
 def get_config():
     return {
@@ -308,16 +312,17 @@ def get_or_build_tokenizer(config, dataset, language):
     return tokenizer
 
 def greedy_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt, max_len, device):
+    model_module = get_model_module(model)
     sos_idx = tokenizer_tgt.token_to_id('[SOS]')
     eos_idx = tokenizer_tgt.token_to_id('[EOS]')
-    encoder_output = model.encode(source, source_mask)
+    encoder_output = model_module.encode(source, source_mask)
     decoder_input = torch.empty(1, 1).fill_(sos_idx).type_as(source).to(device)
     while True:
         if decoder_input.size(1) == max_len:
             break
         decoder_mask = causal_mask(decoder_input.size(1)).type_as(source_mask).to(device)
-        decoder_output = model.decode(encoder_output, source_mask, decoder_input, decoder_mask)
-        prob = model.project(decoder_output[:, -1])
+        decoder_output = model_module.decode(encoder_output, source_mask, decoder_input, decoder_mask)
+        prob = model_module.project(decoder_output[:, -1])
         _, next_word = torch.max(prob, dim=1)
         decoder_input = torch.cat([decoder_input, torch.empty(1, 1).type_as(source).fill_(next_word.item()).to(device)], dim=1)
         if next_word.item() == eos_idx:
@@ -325,10 +330,11 @@ def greedy_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt, max_
     return decoder_input.squeeze(0)
 
 def beam_search_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt, max_len, device, beam_size):
+    model_module = get_model_module(model)
     sos_idx = tokenizer_tgt.token_to_id('[SOS]')
     eos_idx = tokenizer_tgt.token_to_id('[EOS]')
 
-    encoder_output = model.encode(source, source_mask)
+    encoder_output = model_module.encode(source, source_mask)
 
     # Start with a single beam containing only the SOS token
     beams = [(torch.tensor([sos_idx], dtype=torch.long, device=device), 0.0)]
@@ -346,9 +352,9 @@ def beam_search_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt,
             decoder_input = seq.unsqueeze(0)
             decoder_mask = causal_mask(decoder_input.size(1)).type_as(source_mask).to(device)
             
-            decoder_output = model.decode(encoder_output, source_mask, decoder_input, decoder_mask)
+            decoder_output = model_module.decode(encoder_output, source_mask, decoder_input, decoder_mask)
             
-            prob = model.project(decoder_output[:, -1])
+            prob = model_module.project(decoder_output[:, -1])
             log_prob = torch.log_softmax(prob, dim=-1)
             
             top_k_log_probs, top_k_indices = torch.topk(log_prob, beam_size, dim=-1)
@@ -370,10 +376,11 @@ def beam_search_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt,
     return best_seq
 
 def top_k_sampling_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt, max_len, device, top_k):
+    model_module = get_model_module(model)
     sos_idx = tokenizer_tgt.token_to_id('[SOS]')
     eos_idx = tokenizer_tgt.token_to_id('[EOS]')
 
-    encoder_output = model.encode(source, source_mask)
+    encoder_output = model_module.encode(source, source_mask)
     decoder_input = torch.empty(1, 1).fill_(sos_idx).type_as(source).to(device)
 
     while True:
@@ -381,9 +388,9 @@ def top_k_sampling_decode(model, source, source_mask, tokenizer_src, tokenizer_t
             break
 
         decoder_mask = causal_mask(decoder_input.size(1)).type_as(source_mask).to(device)
-        decoder_output = model.decode(encoder_output, source_mask, decoder_input, decoder_mask)
+        decoder_output = model_module.decode(encoder_output, source_mask, decoder_input, decoder_mask)
         
-        prob = model.project(decoder_output[:, -1])
+        prob = model_module.project(decoder_output[:, -1])
         
         # Apply top-k sampling
         top_k_probs, top_k_indices = torch.topk(prob, top_k, dim=-1)
