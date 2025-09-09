@@ -37,8 +37,18 @@ def get_test_dataset(config):
 
     # Create test dataset and dataloader
     test_dataset = BilingualDataset(test_data, tokenizer_src, tokenizer_tgt, config['lang_src'], config['lang_tgt'], config['seq_len'], device=None)  # CPU for data loading
-    # Use multiple workers for faster data loading
-    test_dataloader = DataLoader(test_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=4)
+    # Use optimized settings for multi-GPU evaluation
+    num_workers = min(4, config.get('num_workers', 4))  # Limit workers for Kaggle
+    pin_memory = torch.cuda.is_available()  # Pin memory for faster GPU transfer
+    
+    test_dataloader = DataLoader(
+        test_dataset, 
+        batch_size=config['batch_size'], 
+        shuffle=False, 
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=True if num_workers > 0 else False
+    )
 
     print(f"Test dataset loaded: {len(test_dataset)} examples")
 
@@ -446,6 +456,7 @@ if __name__ == "__main__":
     parser.add_argument("--gpus", type=int, default=None, help="Number of GPUs to use (default: all available)")
     parser.add_argument("--strategy", choices=["greedy", "beam", "topk", "all"], default="all", help="Decoding strategy for translation/evaluation")
     parser.add_argument("--positional_encoding", type=str, default="rope", choices=["rope", "relative"], help="Positional encoding type")
+    parser.add_argument("--num_workers", type=int, default=4, help="Number of data loading workers")
     
     args = parser.parse_args()
     
@@ -454,6 +465,7 @@ if __name__ == "__main__":
     config['num_gpus'] = args.gpus
     config['strategy'] = args.strategy
     config['positional_encoding'] = args.positional_encoding
+    config['num_workers'] = args.num_workers
     
     if args.evaluate:
         evaluate_model(args.epoch_number, config)

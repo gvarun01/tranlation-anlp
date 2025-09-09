@@ -121,10 +121,33 @@ def get_dataset(config):
     validation_dataset = BilingualDataset(val_data, tokenizer_src, tokenizer_tgt, config['lang_src'], config['lang_tgt'], config['seq_len'], device=None)  # CPU for data loading
     test_dataset = BilingualDataset(test_data, tokenizer_src, tokenizer_tgt, config['lang_src'], config['lang_tgt'], config['seq_len'], device=None)  # CPU for data loading
 
-    # Create data loaders
-    train_dataloader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, drop_last=True)
-    validation_dataloader = DataLoader(validation_dataset, batch_size=1, shuffle=False)  # No shuffling for validation
-    test_dataloader = DataLoader(test_dataset, batch_size=1, shuffle=False)  # No shuffling for test
+    # Create data loaders with optimized settings for multi-GPU
+    num_workers = min(4, config.get('num_workers', 4))  # Limit workers for Kaggle
+    pin_memory = torch.cuda.is_available()  # Pin memory for faster GPU transfer
+    
+    train_dataloader = DataLoader(
+        train_dataset, 
+        batch_size=config['batch_size'], 
+        shuffle=True, 
+        drop_last=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=True if num_workers > 0 else False
+    )
+    validation_dataloader = DataLoader(
+        validation_dataset, 
+        batch_size=1, 
+        shuffle=False,
+        num_workers=0,  # No workers for validation to avoid issues
+        pin_memory=pin_memory
+    )
+    test_dataloader = DataLoader(
+        test_dataset, 
+        batch_size=1, 
+        shuffle=False,
+        num_workers=0,  # No workers for test to avoid issues
+        pin_memory=pin_memory
+    )
 
     print(f"Dataset loaded with pre-defined splits:")
     print(f"  Train: {len(train_dataset)} examples")
@@ -178,6 +201,12 @@ def train_model(config):
     if num_gpus > 1:
         model = torch.nn.DataParallel(model)
         print(f"Model wrapped with DataParallel using {num_gpus} GPUs")
+        
+        # Debug multi-GPU setup
+        print(f"DataParallel device_ids: {list(range(num_gpus))}")
+        print(f"Model device: {next(model.parameters()).device}")
+        print(f"Available GPUs: {[torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]}")
+        print(f"CUDA memory per GPU: {[torch.cuda.get_device_properties(i).total_memory // 1024**3 for i in range(torch.cuda.device_count())]} GB")
     
     model = model.to(device)
     
@@ -187,6 +216,7 @@ def train_model(config):
     effective_lr = config['lr'] * num_gpus if num_gpus > 1 else config['lr']
     optimizer = torch.optim.Adam(model.parameters(), lr=effective_lr, betas=(0.9, 0.98), eps=1e-9)
     print(f"Effective learning rate: {effective_lr}")
+    print(f"DataLoader workers: {num_workers}, Pin memory: {pin_memory}")
 
     initial_epoch = 0
     global_step = 0
@@ -411,6 +441,7 @@ if __name__ == "__main__":
     parser.add_argument("--val_eval_frequency", type=int, default=1, help="Validate every N epochs")
     parser.add_argument("--save_frequency", type=int, default=1, help="Save checkpoint every N epochs")
     parser.add_argument("--positional_encoding", type=str, default="rope", choices=["rope", "relative"], help="Positional encoding type")
+    parser.add_argument("--num_workers", type=int, default=4, help="Number of data loading workers")
     
     args = parser.parse_args()
     
@@ -431,5 +462,6 @@ if __name__ == "__main__":
     config['val_eval_frequency'] = args.val_eval_frequency
     config['save_frequency'] = args.save_frequency
     config['positional_encoding'] = args.positional_encoding
+    config['num_workers'] = args.num_workers
     
     train_model(config)
