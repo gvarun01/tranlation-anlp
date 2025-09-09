@@ -49,6 +49,8 @@ def evaluate_model(epoch_number: str, config):
     if torch.cuda.is_available():
         available_gpus = torch.cuda.device_count()
         requested_gpus = config.get('num_gpus', available_gpus)
+        if requested_gpus is None:
+            requested_gpus = available_gpus
         num_gpus = min(requested_gpus, available_gpus)
         device = torch.device('cuda')
         print(f"Found {available_gpus} GPU(s), using {num_gpus} GPU(s) for evaluation")
@@ -283,6 +285,8 @@ def translate(epoch_number: str, sentence: str, config):
     if torch.cuda.is_available():
         available_gpus = torch.cuda.device_count()
         requested_gpus = config.get('num_gpus', available_gpus)
+        if requested_gpus is None:
+            requested_gpus = available_gpus
         num_gpus = min(requested_gpus, available_gpus)
         device = torch.device('cuda')
         print(f"Found {available_gpus} GPU(s), using {num_gpus} GPU(s) for translation")

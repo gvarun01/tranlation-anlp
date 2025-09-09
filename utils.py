@@ -15,6 +15,10 @@ def get_config():
         "lr": 10**-4,
         "seq_len": 150,
         "d_model": 512,
+        "N": 6,  # Number of transformer layers
+        "h": 8,  # Number of attention heads
+        "dropout": 0.1,  # Dropout rate
+        "d_ff": 2048,  # Feed-forward dimension
         "lang_src": "fi",
         "lang_tgt": "en",
         "model_folder": "weights",
