@@ -75,14 +75,6 @@ def get_dataset(config):
     val_data = load_dataset_by_split(config, 'val')
     test_data = load_dataset_by_split(config, 'test')
 
-    # Use tiny subset for debugging if specified
-    if config.get('tiny_subset', False):
-        print("Using tiny subset for debugging...")
-        train_data = train_data[:100]  # Use only 100 examples for training
-        val_data = val_data[:50]       # Use only 50 examples for validation
-        test_data = test_data[:50]     # Use only 50 examples for testing
-        print(f"Tiny subset - Train: {len(train_data)}, Val: {len(val_data)}, Test: {len(test_data)}")
-
     tokenizer_src = get_or_build_tokenizer(config, None, config['lang_src'])
     tokenizer_tgt = get_or_build_tokenizer(config, None, config['lang_tgt'])
 
@@ -110,12 +102,27 @@ def get_model(config, vocab_src_len, vocab_tgt_len):
         config['seq_len'],
         config['seq_len'],
         d_model=config['d_model'],
+        N=config['N'],
+        h=config['h'],
+        dropout=config['dropout'],
+        d_ff=config['d_ff']
     )
     return model
 
 def train_model(config):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
+    # Check for GPU availability and count
+    if torch.cuda.is_available():
+        available_gpus = torch.cuda.device_count()
+        requested_gpus = config.get('num_gpus', available_gpus)
+        num_gpus = min(requested_gpus, available_gpus)
+        device = torch.device('cuda')
+        print(f"Found {available_gpus} GPU(s), using {num_gpus} GPU(s)")
+        if num_gpus > 1:
+            print("Using DataParallel for multi-GPU training")
+    else:
+        device = torch.device('cpu')
+        num_gpus = 0
+        print("Using CPU for training")
 
     # Set up the base path for saving models and tokenizers
     base_path = Path('.')
@@ -124,10 +131,21 @@ def train_model(config):
     (base_path / config['model_folder']).mkdir(parents=True, exist_ok=True)
 
     train_dataloader, validation_dataloader, test_dataloader, tokenizer_src, tokenizer_tgt = get_dataset(config)
-    model = get_model(config, tokenizer_src.get_vocab_size(), tokenizer_tgt.get_vocab_size()).to(device)
+    model = get_model(config, tokenizer_src.get_vocab_size(), tokenizer_tgt.get_vocab_size())
+    
+    # Wrap model with DataParallel if multiple GPUs are available
+    if num_gpus > 1:
+        model = torch.nn.DataParallel(model)
+        print(f"Model wrapped with DataParallel using {num_gpus} GPUs")
+    
+    model = model.to(device)
     
     writer = SummaryWriter(config['experiment_name'])
-    optimizer = torch.optim.Adam(model.parameters(), lr=config['lr'], eps=1e-9)
+    
+    # Adjust learning rate for multi-GPU training
+    effective_lr = config['lr'] * num_gpus if num_gpus > 1 else config['lr']
+    optimizer = torch.optim.Adam(model.parameters(), lr=effective_lr, eps=1e-9)
+    print(f"Effective learning rate: {effective_lr}")
 
     initial_epoch = 0
     global_step = 0
@@ -138,7 +156,28 @@ def train_model(config):
         print(f"Loading checkpoint: {checkpoint_path}")
         try:
             state = torch.load(checkpoint_path, map_location=device, weights_only=False)
-            model.load_state_dict(state['model_state_dict'])
+            # Handle DataParallel checkpoint loading
+            if num_gpus > 1:
+                # If checkpoint was saved with DataParallel, load it directly
+                if 'module.' in list(state['model_state_dict'].keys())[0]:
+                    model.load_state_dict(state['model_state_dict'])
+                else:
+                    # If checkpoint was saved without DataParallel, remove 'module.' prefix
+                    new_state_dict = {}
+                    for k, v in state['model_state_dict'].items():
+                        new_state_dict['module.' + k] = v
+                    model.load_state_dict(new_state_dict)
+            else:
+                # Single GPU loading
+                if 'module.' in list(state['model_state_dict'].keys())[0]:
+                    # Remove 'module.' prefix for single GPU
+                    new_state_dict = {}
+                    for k, v in state['model_state_dict'].items():
+                        new_state_dict[k.replace('module.', '')] = v
+                    model.load_state_dict(new_state_dict)
+                else:
+                    model.load_state_dict(state['model_state_dict'])
+            
             initial_epoch = state['epoch'] + 1
             optimizer.load_state_dict(state['optimizer_state_dict'])
             global_step = state.get('global_step', 0)
@@ -188,9 +227,17 @@ def train_model(config):
         
         # Save model checkpoint
         model_filename = get_weights_path(config, f'{epoch:02d}')
+        
+        # Handle DataParallel checkpoint saving
+        if num_gpus > 1:
+            # Save the underlying model state_dict (without DataParallel wrapper)
+            model_state_dict = model.module.state_dict()
+        else:
+            model_state_dict = model.state_dict()
+            
         torch.save({
             "epoch": epoch,
-            "model_state_dict": model.state_dict(),
+            "model_state_dict": model_state_dict,
             "optimizer_state_dict": optimizer.state_dict(),
             "global_step": global_step,
         }, model_filename)
@@ -207,7 +254,7 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=10**-4, help="Learning rate")
     parser.add_argument("--seq_len", type=int, default=150, help="Sequence length")
     parser.add_argument("--d_model", type=int, default=512, help="Model dimension")
-    parser.add_argument("--tiny_subset", action="store_true", help="Use tiny subset (100 train, 50 val, 50 test) for debugging")
+    parser.add_argument("--gpus", type=int, default=None, help="Number of GPUs to use (default: all available)")
     
     args = parser.parse_args()
     
@@ -220,6 +267,6 @@ if __name__ == "__main__":
     config['lr'] = args.lr
     config['seq_len'] = args.seq_len
     config['d_model'] = args.d_model
-    config['tiny_subset'] = args.tiny_subset
+    config['num_gpus'] = args.gpus
     
     train_model(config)

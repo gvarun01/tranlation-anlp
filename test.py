@@ -28,12 +28,6 @@ def get_test_dataset(config):
     # Load the pre-split test data
     test_data = load_dataset_by_split(config, 'test')
 
-    # Use tiny subset for debugging if specified
-    if config.get('tiny_subset', False):
-        print("Using tiny subset for testing...")
-        test_data = test_data[:50]  # Use only 50 examples for testing
-        print(f"Tiny subset - Test: {len(test_data)} examples")
-
     # Load tokenizers
     tokenizer_src_path = Path(config['tokenizer_file'].format(config['lang_src']))
     tokenizer_tgt_path = Path(config['tokenizer_file'].format(config['lang_tgt']))
@@ -51,8 +45,19 @@ def get_test_dataset(config):
 
 def evaluate_model(epoch_number: str, config):
     """Evaluate the model on the test set and calculate BLEU score"""
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    # Check for GPU availability and count
+    if torch.cuda.is_available():
+        available_gpus = torch.cuda.device_count()
+        requested_gpus = config.get('num_gpus', available_gpus)
+        num_gpus = min(requested_gpus, available_gpus)
+        device = torch.device('cuda')
+        print(f"Found {available_gpus} GPU(s), using {num_gpus} GPU(s) for evaluation")
+        if num_gpus > 1:
+            print("Using DataParallel for multi-GPU evaluation")
+    else:
+        device = torch.device('cpu')
+        num_gpus = 0
+        print("Using CPU for evaluation")
     
     # Load tokenizers
     tokenizer_src_path = Path(config['tokenizer_file'].format(config['lang_src']))
@@ -72,8 +77,19 @@ def evaluate_model(epoch_number: str, config):
         tokenizer_tgt.get_vocab_size(), 
         config['seq_len'],
         config['seq_len'],
-        d_model=config['d_model']
-    ).to(device)
+        d_model=config['d_model'],
+        N=config['N'],
+        h=config['h'],
+        dropout=config['dropout'],
+        d_ff=config['d_ff']
+    )
+    
+    # Wrap model with DataParallel if multiple GPUs are available
+    if num_gpus > 1:
+        model = torch.nn.DataParallel(model)
+        print(f"Model wrapped with DataParallel using {num_gpus} GPUs")
+    
+    model = model.to(device)
 
     # Load the pretrained weights using auto-detection
     model_filename = get_checkpoint_path_for_epoch(config, epoch_number)
@@ -81,7 +97,27 @@ def evaluate_model(epoch_number: str, config):
         print(f"Loading model weights from epoch {epoch_number}: {model_filename}")
         try:
             state = torch.load(model_filename, map_location=device, weights_only=False)
-            model.load_state_dict(state['model_state_dict'])
+            # Handle DataParallel checkpoint loading
+            if num_gpus > 1:
+                # If checkpoint was saved with DataParallel, load it directly
+                if 'module.' in list(state['model_state_dict'].keys())[0]:
+                    model.load_state_dict(state['model_state_dict'])
+                else:
+                    # If checkpoint was saved without DataParallel, add 'module.' prefix
+                    new_state_dict = {}
+                    for k, v in state['model_state_dict'].items():
+                        new_state_dict['module.' + k] = v
+                    model.load_state_dict(new_state_dict)
+            else:
+                # Single GPU loading
+                if 'module.' in list(state['model_state_dict'].keys())[0]:
+                    # Remove 'module.' prefix for single GPU
+                    new_state_dict = {}
+                    for k, v in state['model_state_dict'].items():
+                        new_state_dict[k.replace('module.', '')] = v
+                    model.load_state_dict(new_state_dict)
+                else:
+                    model.load_state_dict(state['model_state_dict'])
         except Exception as e:
             print(f"Error loading checkpoint: {e}")
             sys.exit(1)
@@ -243,8 +279,19 @@ def translate(epoch_number: str, sentence: str, config):
     """
     Translates a sentence using greedy, beam search, and top-k sampling decoding strategies.
     """
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    # Check for GPU availability and count
+    if torch.cuda.is_available():
+        available_gpus = torch.cuda.device_count()
+        requested_gpus = config.get('num_gpus', available_gpus)
+        num_gpus = min(requested_gpus, available_gpus)
+        device = torch.device('cuda')
+        print(f"Found {available_gpus} GPU(s), using {num_gpus} GPU(s) for translation")
+        if num_gpus > 1:
+            print("Using DataParallel for multi-GPU translation")
+    else:
+        device = torch.device('cpu')
+        num_gpus = 0
+        print("Using CPU for translation")
     
     # Load tokenizers from local paths
     tokenizer_src_path = Path(config['tokenizer_file'].format(config['lang_src']))
@@ -264,8 +311,19 @@ def translate(epoch_number: str, sentence: str, config):
         tokenizer_tgt.get_vocab_size(), 
         config['seq_len'],
         config['seq_len'],
-        d_model=config['d_model']
-    ).to(device)
+        d_model=config['d_model'],
+        N=config['N'],
+        h=config['h'],
+        dropout=config['dropout'],
+        d_ff=config['d_ff']
+    )
+    
+    # Wrap model with DataParallel if multiple GPUs are available
+    if num_gpus > 1:
+        model = torch.nn.DataParallel(model)
+        print(f"Model wrapped with DataParallel using {num_gpus} GPUs")
+    
+    model = model.to(device)
 
     # Load the pretrained weights using auto-detection
     model_filename = get_checkpoint_path_for_epoch(config, epoch_number)
@@ -273,7 +331,27 @@ def translate(epoch_number: str, sentence: str, config):
         print(f"Loading model weights from epoch {epoch_number}: {model_filename}")
         try:
             state = torch.load(model_filename, map_location=device, weights_only=False)
-            model.load_state_dict(state['model_state_dict'])
+            # Handle DataParallel checkpoint loading
+            if num_gpus > 1:
+                # If checkpoint was saved with DataParallel, load it directly
+                if 'module.' in list(state['model_state_dict'].keys())[0]:
+                    model.load_state_dict(state['model_state_dict'])
+                else:
+                    # If checkpoint was saved without DataParallel, add 'module.' prefix
+                    new_state_dict = {}
+                    for k, v in state['model_state_dict'].items():
+                        new_state_dict['module.' + k] = v
+                    model.load_state_dict(new_state_dict)
+            else:
+                # Single GPU loading
+                if 'module.' in list(state['model_state_dict'].keys())[0]:
+                    # Remove 'module.' prefix for single GPU
+                    new_state_dict = {}
+                    for k, v in state['model_state_dict'].items():
+                        new_state_dict[k.replace('module.', '')] = v
+                    model.load_state_dict(new_state_dict)
+                else:
+                    model.load_state_dict(state['model_state_dict'])
         except Exception as e:
             print(f"Error loading checkpoint: {e}")
             sys.exit(1)
@@ -357,13 +435,13 @@ if __name__ == "__main__":
     parser.add_argument("sentence", nargs='?', help="Sentence to translate (if not evaluating)")
     parser.add_argument("--evaluate", action="store_true", help="Run evaluation instead of translation")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size for evaluation")
-    parser.add_argument("--tiny_subset", action="store_true", help="Use tiny subset for testing (same as training)")
+    parser.add_argument("--gpus", type=int, default=None, help="Number of GPUs to use (default: all available)")
     
     args = parser.parse_args()
     
     config = get_config()
     config['batch_size'] = args.batch_size
-    config['tiny_subset'] = args.tiny_subset
+    config['num_gpus'] = args.gpus
     
     if args.evaluate:
         evaluate_model(args.epoch_number, config)
