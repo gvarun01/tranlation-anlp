@@ -35,6 +35,10 @@ def get_config():
         "decoding_strategy": "greedy", # or "beam", "top-k"
         "beam_size": 5,
         "top_k": 3,
+        "repetition_penalty": 1.1,  # Penalty for repeating tokens
+        "unk_penalty": 1.5,  # Penalty for UNK tokens
+        "length_penalty": 1.0,  # Length penalty for beam search
+        "temperature": 1.0,  # Temperature for top-k sampling
         "warmup_steps": 2000,
         "early_stopping_patience": 5,  # Stop if no improvement for N epochs
         "gradient_accumulation_steps": 1,  # Accumulate gradients over N steps
@@ -346,40 +350,107 @@ def get_or_build_tokenizer(config, dataset, language):
         tokenizer = Tokenizer.from_file(str(tokenizer_path))
     return tokenizer
 
-def greedy_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt, max_len, device):
-    model_module = get_model_module(model)
+def greedy_decode_optimized(model_module, encoder_output, source_mask, tokenizer_tgt, max_len, device, repetition_penalty=1.0, unk_penalty=1.0):
+    """Optimized greedy decode that takes pre-computed encoder output"""
     sos_idx = tokenizer_tgt.token_to_id('[SOS]')
     eos_idx = tokenizer_tgt.token_to_id('[EOS]')
-    encoder_output = model_module.encode(source, source_mask)
-    decoder_input = torch.empty(1, 1).fill_(sos_idx).type_as(source).to(device)
+    unk_idx = tokenizer_tgt.token_to_id('[UNK]')
+    
+    decoder_input = torch.empty(1, 1).fill_(sos_idx).type_as(encoder_output).to(device)
+    
+    # Track generated tokens for repetition penalty
+    generated_tokens = set()
+    
     while True:
         if decoder_input.size(1) == max_len:
             break
         decoder_mask = causal_mask(decoder_input.size(1), device=device).type_as(source_mask).to(device)
         decoder_output = model_module.decode(encoder_output, source_mask, decoder_input, decoder_mask)
-        prob = model_module.project(decoder_output[:, -1])
-        _, next_word = torch.max(prob, dim=1)
-        decoder_input = torch.cat([decoder_input, torch.empty(1, 1).type_as(source).fill_(next_word.item()).to(device)], dim=1)
+        logits = model_module.project(decoder_output[:, -1])
+        
+        # Apply repetition penalty
+        if repetition_penalty != 1.0:
+            for token_id in generated_tokens:
+                if logits[0, token_id] > 0:
+                    logits[0, token_id] /= repetition_penalty
+                else:
+                    logits[0, token_id] *= repetition_penalty
+        
+        # Apply UNK penalty
+        if unk_penalty != 1.0 and unk_idx is not None:
+            if logits[0, unk_idx] > 0:
+                logits[0, unk_idx] /= unk_penalty
+            else:
+                logits[0, unk_idx] *= unk_penalty
+        
+        _, next_word = torch.max(logits, dim=1)
+        decoder_input = torch.cat([decoder_input, torch.empty(1, 1).type_as(encoder_output).fill_(next_word.item()).to(device)], dim=1)
+        
+        # Track generated tokens
+        generated_tokens.add(next_word.item())
+        
         if next_word.item() == eos_idx:
             break
     return decoder_input.squeeze(0)
 
-def beam_search_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt, max_len, device, beam_size):
+def greedy_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt, max_len, device, repetition_penalty=1.0, unk_penalty=1.0):
     model_module = get_model_module(model)
     sos_idx = tokenizer_tgt.token_to_id('[SOS]')
     eos_idx = tokenizer_tgt.token_to_id('[EOS]')
-
+    unk_idx = tokenizer_tgt.token_to_id('[UNK]')
     encoder_output = model_module.encode(source, source_mask)
+    decoder_input = torch.empty(1, 1).fill_(sos_idx).type_as(source).to(device)
+    
+    # Track generated tokens for repetition penalty
+    generated_tokens = set()
+    
+    while True:
+        if decoder_input.size(1) == max_len:
+            break
+        decoder_mask = causal_mask(decoder_input.size(1), device=device).type_as(source_mask).to(device)
+        decoder_output = model_module.decode(encoder_output, source_mask, decoder_input, decoder_mask)
+        logits = model_module.project(decoder_output[:, -1])
+        
+        # Apply repetition penalty
+        if repetition_penalty != 1.0:
+            for token_id in generated_tokens:
+                if logits[0, token_id] > 0:
+                    logits[0, token_id] /= repetition_penalty
+                else:
+                    logits[0, token_id] *= repetition_penalty
+        
+        # Apply UNK penalty
+        if unk_penalty != 1.0 and unk_idx is not None:
+            if logits[0, unk_idx] > 0:
+                logits[0, unk_idx] /= unk_penalty
+            else:
+                logits[0, unk_idx] *= unk_penalty
+        
+        _, next_word = torch.max(logits, dim=1)
+        decoder_input = torch.cat([decoder_input, torch.empty(1, 1).type_as(source).fill_(next_word.item()).to(device)], dim=1)
+        
+        # Track generated tokens
+        generated_tokens.add(next_word.item())
+        
+        if next_word.item() == eos_idx:
+            break
+    return decoder_input.squeeze(0)
+
+def beam_search_decode_optimized(model_module, encoder_output, source_mask, tokenizer_tgt, max_len, device, beam_size, repetition_penalty=1.0, unk_penalty=1.0, length_penalty=1.0):
+    """Optimized beam search decode that takes pre-computed encoder output"""
+    sos_idx = tokenizer_tgt.token_to_id('[SOS]')
+    eos_idx = tokenizer_tgt.token_to_id('[EOS]')
+    unk_idx = tokenizer_tgt.token_to_id('[UNK]')
 
     # Start with a single beam containing only the SOS token
-    beams = [(torch.tensor([sos_idx], dtype=torch.long, device=device), 0.0)]
+    beams = [(torch.tensor([sos_idx], dtype=torch.long, device=device), 0.0, set([sos_idx]))]
 
     for _ in range(max_len):
         new_beams = []
         all_ended = True
-        for seq, score in beams:
+        for seq, score, generated_tokens in beams:
             if seq[-1].item() == eos_idx:
-                new_beams.append((seq, score))
+                new_beams.append((seq, score, generated_tokens))
                 continue
             
             all_ended = False
@@ -389,15 +460,37 @@ def beam_search_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt,
             
             decoder_output = model_module.decode(encoder_output, source_mask, decoder_input, decoder_mask)
             
-            prob = model_module.project(decoder_output[:, -1])
-            log_prob = torch.log_softmax(prob, dim=-1)
+            logits = model_module.project(decoder_output[:, -1])
+            
+            # Apply repetition penalty
+            if repetition_penalty != 1.0:
+                for token_id in generated_tokens:
+                    if logits[0, token_id] > 0:
+                        logits[0, token_id] /= repetition_penalty
+                    else:
+                        logits[0, token_id] *= repetition_penalty
+            
+            # Apply UNK penalty
+            if unk_penalty != 1.0 and unk_idx is not None:
+                if logits[0, unk_idx] > 0:
+                    logits[0, unk_idx] /= unk_penalty
+                else:
+                    logits[0, unk_idx] *= unk_penalty
+            
+            log_prob = torch.log_softmax(logits, dim=-1)
             
             top_k_log_probs, top_k_indices = torch.topk(log_prob, beam_size, dim=-1)
 
             for i in range(beam_size):
+                new_token = top_k_indices[0, i].item()
                 new_seq = torch.cat([seq, top_k_indices[0, i].unsqueeze(0)], dim=0)
-                new_score = score + top_k_log_probs[0, i].item()
-                new_beams.append((new_seq, new_score))
+                new_generated_tokens = generated_tokens.copy()
+                new_generated_tokens.add(new_token)
+                
+                # Apply length penalty
+                length_penalty_score = ((5 + len(new_seq)) / 6) ** length_penalty
+                new_score = (score + top_k_log_probs[0, i].item()) / length_penalty_score
+                new_beams.append((new_seq, new_score, new_generated_tokens))
 
         # Sort all new beams by score and keep the top `beam_size`
         beams = sorted(new_beams, key=lambda x: x[1], reverse=True)[:beam_size]
@@ -407,16 +500,88 @@ def beam_search_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt,
             break
 
     # Return the sequence from the beam with the highest score
-    best_seq, _ = beams[0]
+    best_seq, _, _ = beams[0]
     return best_seq
 
-def top_k_sampling_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt, max_len, device, top_k):
+def beam_search_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt, max_len, device, beam_size, repetition_penalty=1.0, unk_penalty=1.0, length_penalty=1.0):
     model_module = get_model_module(model)
     sos_idx = tokenizer_tgt.token_to_id('[SOS]')
     eos_idx = tokenizer_tgt.token_to_id('[EOS]')
+    unk_idx = tokenizer_tgt.token_to_id('[UNK]')
 
     encoder_output = model_module.encode(source, source_mask)
-    decoder_input = torch.empty(1, 1).fill_(sos_idx).type_as(source).to(device)
+
+    # Start with a single beam containing only the SOS token
+    beams = [(torch.tensor([sos_idx], dtype=torch.long, device=device), 0.0, set([sos_idx]))]
+
+    for _ in range(max_len):
+        new_beams = []
+        all_ended = True
+        for seq, score, generated_tokens in beams:
+            if seq[-1].item() == eos_idx:
+                new_beams.append((seq, score, generated_tokens))
+                continue
+            
+            all_ended = False
+
+            decoder_input = seq.unsqueeze(0)
+            decoder_mask = causal_mask(decoder_input.size(1), device=device).type_as(source_mask).to(device)
+            
+            decoder_output = model_module.decode(encoder_output, source_mask, decoder_input, decoder_mask)
+            
+            logits = model_module.project(decoder_output[:, -1])
+            
+            # Apply repetition penalty
+            if repetition_penalty != 1.0:
+                for token_id in generated_tokens:
+                    if logits[0, token_id] > 0:
+                        logits[0, token_id] /= repetition_penalty
+                    else:
+                        logits[0, token_id] *= repetition_penalty
+            
+            # Apply UNK penalty
+            if unk_penalty != 1.0 and unk_idx is not None:
+                if logits[0, unk_idx] > 0:
+                    logits[0, unk_idx] /= unk_penalty
+                else:
+                    logits[0, unk_idx] *= unk_penalty
+            
+            log_prob = torch.log_softmax(logits, dim=-1)
+            
+            top_k_log_probs, top_k_indices = torch.topk(log_prob, beam_size, dim=-1)
+
+            for i in range(beam_size):
+                new_token = top_k_indices[0, i].item()
+                new_seq = torch.cat([seq, top_k_indices[0, i].unsqueeze(0)], dim=0)
+                new_generated_tokens = generated_tokens.copy()
+                new_generated_tokens.add(new_token)
+                
+                # Apply length penalty
+                length_penalty_score = ((5 + len(new_seq)) / 6) ** length_penalty
+                new_score = (score + top_k_log_probs[0, i].item()) / length_penalty_score
+                new_beams.append((new_seq, new_score, new_generated_tokens))
+
+        # Sort all new beams by score and keep the top `beam_size`
+        beams = sorted(new_beams, key=lambda x: x[1], reverse=True)[:beam_size]
+
+        # Check if all beams have ended with EOS
+        if all_ended:
+            break
+
+    # Return the sequence from the beam with the highest score
+    best_seq, _, _ = beams[0]
+    return best_seq
+
+def top_k_sampling_decode_optimized(model_module, encoder_output, source_mask, tokenizer_tgt, max_len, device, top_k, repetition_penalty=1.0, unk_penalty=1.0, temperature=1.0):
+    """Optimized top-k sampling decode that takes pre-computed encoder output"""
+    sos_idx = tokenizer_tgt.token_to_id('[SOS]')
+    eos_idx = tokenizer_tgt.token_to_id('[EOS]')
+    unk_idx = tokenizer_tgt.token_to_id('[UNK]')
+
+    decoder_input = torch.empty(1, 1).fill_(sos_idx).type_as(encoder_output).to(device)
+    
+    # Track generated tokens for repetition penalty
+    generated_tokens = set()
 
     while True:
         if decoder_input.size(1) == max_len:
@@ -425,10 +590,29 @@ def top_k_sampling_decode(model, source, source_mask, tokenizer_src, tokenizer_t
         decoder_mask = causal_mask(decoder_input.size(1), device=device).type_as(source_mask).to(device)
         decoder_output = model_module.decode(encoder_output, source_mask, decoder_input, decoder_mask)
         
-        prob = model_module.project(decoder_output[:, -1])
+        logits = model_module.project(decoder_output[:, -1])
+        
+        # Apply repetition penalty
+        if repetition_penalty != 1.0:
+            for token_id in generated_tokens:
+                if logits[0, token_id] > 0:
+                    logits[0, token_id] /= repetition_penalty
+                else:
+                    logits[0, token_id] *= repetition_penalty
+        
+        # Apply UNK penalty
+        if unk_penalty != 1.0 and unk_idx is not None:
+            if logits[0, unk_idx] > 0:
+                logits[0, unk_idx] /= unk_penalty
+            else:
+                logits[0, unk_idx] *= unk_penalty
+        
+        # Apply temperature scaling
+        if temperature != 1.0:
+            logits = logits / temperature
         
         # Apply top-k sampling
-        top_k_probs, top_k_indices = torch.topk(prob, top_k, dim=-1)
+        top_k_probs, top_k_indices = torch.topk(logits, top_k, dim=-1)
         
         # Create a new distribution from the top-k probabilities
         dist = torch.distributions.categorical.Categorical(logits=top_k_probs)
@@ -436,6 +620,123 @@ def top_k_sampling_decode(model, source, source_mask, tokenizer_src, tokenizer_t
         next_word = top_k_indices.gather(-1, next_token_idx_in_top_k.unsqueeze(-1)).squeeze(-1)
 
         decoder_input = torch.cat([decoder_input, next_word.unsqueeze(0)], dim=1)
+        
+        # Track generated tokens
+        generated_tokens.add(next_word.item())
+
+        if next_word.item() == eos_idx:
+            break
+            
+    return decoder_input.squeeze(0)
+
+def batch_greedy_decode(model_module, encoder_output, source_mask, tokenizer_tgt, max_len, device, repetition_penalty=1.0, unk_penalty=1.0):
+    """Batch greedy decoding for maximum efficiency"""
+    batch_size = encoder_output.size(0)
+    sos_idx = tokenizer_tgt.token_to_id('[SOS]')
+    eos_idx = tokenizer_tgt.token_to_id('[EOS]')
+    unk_idx = tokenizer_tgt.token_to_id('[UNK]')
+    
+    # Initialize decoder input for all samples in batch
+    decoder_input = torch.full((batch_size, 1), sos_idx, dtype=torch.long, device=device)
+    finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+    
+    # Track generated tokens for each sample
+    generated_tokens = [set() for _ in range(batch_size)]
+    
+    for step in range(max_len):
+        if finished.all():
+            break
+            
+        decoder_mask = causal_mask(decoder_input.size(1), device=device).type_as(source_mask).to(device)
+        decoder_output = model_module.decode(encoder_output, source_mask, decoder_input, decoder_mask)
+        logits = model_module.project(decoder_output[:, -1])  # (batch_size, vocab_size)
+        
+        # Apply repetition penalty
+        if repetition_penalty != 1.0:
+            for i in range(batch_size):
+                if not finished[i]:
+                    for token_id in generated_tokens[i]:
+                        if logits[i, token_id] > 0:
+                            logits[i, token_id] /= repetition_penalty
+                        else:
+                            logits[i, token_id] *= repetition_penalty
+        
+        # Apply UNK penalty
+        if unk_penalty != 1.0 and unk_idx is not None:
+            for i in range(batch_size):
+                if not finished[i]:
+                    if logits[i, unk_idx] > 0:
+                        logits[i, unk_idx] /= unk_penalty
+                    else:
+                        logits[i, unk_idx] *= unk_penalty
+        
+        # Get next tokens
+        _, next_words = torch.max(logits, dim=1)  # (batch_size,)
+        
+        # Update decoder input
+        decoder_input = torch.cat([decoder_input, next_words.unsqueeze(1)], dim=1)
+        
+        # Track generated tokens and check for EOS
+        for i in range(batch_size):
+            if not finished[i]:
+                generated_tokens[i].add(next_words[i].item())
+                if next_words[i].item() == eos_idx:
+                    finished[i] = True
+    
+    return decoder_input
+
+def top_k_sampling_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt, max_len, device, top_k, repetition_penalty=1.0, unk_penalty=1.0, temperature=1.0):
+    model_module = get_model_module(model)
+    sos_idx = tokenizer_tgt.token_to_id('[SOS]')
+    eos_idx = tokenizer_tgt.token_to_id('[EOS]')
+    unk_idx = tokenizer_tgt.token_to_id('[UNK]')
+
+    encoder_output = model_module.encode(source, source_mask)
+    decoder_input = torch.empty(1, 1).fill_(sos_idx).type_as(source).to(device)
+    
+    # Track generated tokens for repetition penalty
+    generated_tokens = set()
+
+    while True:
+        if decoder_input.size(1) == max_len:
+            break
+
+        decoder_mask = causal_mask(decoder_input.size(1), device=device).type_as(source_mask).to(device)
+        decoder_output = model_module.decode(encoder_output, source_mask, decoder_input, decoder_mask)
+        
+        logits = model_module.project(decoder_output[:, -1])
+        
+        # Apply repetition penalty
+        if repetition_penalty != 1.0:
+            for token_id in generated_tokens:
+                if logits[0, token_id] > 0:
+                    logits[0, token_id] /= repetition_penalty
+                else:
+                    logits[0, token_id] *= repetition_penalty
+        
+        # Apply UNK penalty
+        if unk_penalty != 1.0 and unk_idx is not None:
+            if logits[0, unk_idx] > 0:
+                logits[0, unk_idx] /= unk_penalty
+            else:
+                logits[0, unk_idx] *= unk_penalty
+        
+        # Apply temperature scaling
+        if temperature != 1.0:
+            logits = logits / temperature
+        
+        # Apply top-k sampling
+        top_k_probs, top_k_indices = torch.topk(logits, top_k, dim=-1)
+        
+        # Create a new distribution from the top-k probabilities
+        dist = torch.distributions.categorical.Categorical(logits=top_k_probs)
+        next_token_idx_in_top_k = dist.sample()
+        next_word = top_k_indices.gather(-1, next_token_idx_in_top_k.unsqueeze(-1)).squeeze(-1)
+
+        decoder_input = torch.cat([decoder_input, next_word.unsqueeze(0)], dim=1)
+        
+        # Track generated tokens
+        generated_tokens.add(next_word.item())
 
         if next_word.item() == eos_idx:
             break

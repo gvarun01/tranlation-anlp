@@ -5,7 +5,7 @@ from tokenizers import Tokenizer
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from model import build_transformer
-from utils import get_config, greedy_decode, beam_search_decode, top_k_sampling_decode, BilingualDataset, load_dataset_by_split, find_latest_checkpoint, get_checkpoint_path_for_epoch
+from utils import get_config, get_model_module, greedy_decode, beam_search_decode, top_k_sampling_decode, greedy_decode_optimized, beam_search_decode_optimized, top_k_sampling_decode_optimized, batch_greedy_decode, BilingualDataset, load_dataset_by_split, find_latest_checkpoint, get_checkpoint_path_for_epoch
 try:
     import torchmetrics
     from bert_score import BERTScorer
@@ -198,33 +198,99 @@ def evaluate_model(epoch_number: str, config):
         for batch in tqdm(test_dataloader, desc="Evaluating"):
             encoder_input = batch['encoder_input'].to(device)  # (batch_size, seq_len)
             encoder_mask = batch['encoder_mask'].to(device)    # (batch_size, 1, seq_len, seq_len)
+            expected_texts = batch['label_text']  # List of expected texts
 
-            # Process batch more efficiently
             batch_size = encoder_input.size(0)
+            
+            # Initialize output lists for this batch
             outputs_greedy = []
             outputs_beam = []
             outputs_top_k = []
             
-            # Process each sample in the batch
-            for i in range(batch_size):
-                try:
-                    if config.get('strategy', 'all') in ['greedy', 'all']:
-                        greedy_out = greedy_decode(model, encoder_input[i:i+1], encoder_mask[i:i+1], tokenizer_src, tokenizer_tgt, config['seq_len'], device)
-                        outputs_greedy.append(greedy_out)
-                    if config.get('strategy', 'all') in ['beam', 'all']:
-                        beam_out = beam_search_decode(model, encoder_input[i:i+1], encoder_mask[i:i+1], tokenizer_src, tokenizer_tgt, config['seq_len'], device, config['beam_size'])
+            # OPTIMIZATION: Run encoder once per batch instead of per sample
+            model_module = get_model_module(model)
+            encoder_output = model_module.encode(encoder_input, encoder_mask)  # (batch_size, seq_len, d_model)
+            
+            # OPTIMIZATION: Use batch greedy decoding for maximum efficiency
+            if config.get('strategy', 'all') in ['greedy', 'all']:
+                if config.get('use_batch_greedy', True):
+                    try:
+                        batch_greedy_outputs = batch_greedy_decode(
+                            model_module, encoder_output, encoder_mask, tokenizer_tgt, 
+                            config['seq_len'], device, 
+                            repetition_penalty=config.get('repetition_penalty', 1.0),
+                            unk_penalty=config.get('unk_penalty', 1.0)
+                        )
+                        # Split batch outputs into individual samples
+                        for i in range(batch_size):
+                            outputs_greedy.append(batch_greedy_outputs[i])
+                    except Exception as e:
+                        print(f"Warning: Batch greedy decoding failed: {e}")
+                        # Fallback to individual decoding
+                        for i in range(batch_size):
+                            try:
+                                single_encoder_output = encoder_output[i:i+1]
+                                single_encoder_mask = encoder_mask[i:i+1]
+                                greedy_out = greedy_decode_optimized(
+                                    model_module, single_encoder_output, single_encoder_mask, tokenizer_tgt, 
+                                    config['seq_len'], device, 
+                                    repetition_penalty=config.get('repetition_penalty', 1.0),
+                                    unk_penalty=config.get('unk_penalty', 1.0)
+                                )
+                                outputs_greedy.append(greedy_out)
+                            except Exception as e2:
+                                print(f"Warning: Individual greedy decoding failed for sample {i}: {e2}")
+                                outputs_greedy.append(torch.tensor([tokenizer_tgt.token_to_id('[PAD]')], device=device))
+                else:
+                    # Use individual optimized decoding
+                    for i in range(batch_size):
+                        try:
+                            single_encoder_output = encoder_output[i:i+1]
+                            single_encoder_mask = encoder_mask[i:i+1]
+                            greedy_out = greedy_decode_optimized(
+                                model_module, single_encoder_output, single_encoder_mask, tokenizer_tgt, 
+                                config['seq_len'], device, 
+                                repetition_penalty=config.get('repetition_penalty', 1.0),
+                                unk_penalty=config.get('unk_penalty', 1.0)
+                            )
+                            outputs_greedy.append(greedy_out)
+                        except Exception as e:
+                            print(f"Warning: Individual greedy decoding failed for sample {i}: {e}")
+                            outputs_greedy.append(torch.tensor([tokenizer_tgt.token_to_id('[PAD]')], device=device))
+            
+            # For beam search and top-k, we still need individual decoding due to their complexity
+            if config.get('strategy', 'all') in ['beam', 'all']:
+                for i in range(batch_size):
+                    try:
+                        single_encoder_output = encoder_output[i:i+1]
+                        single_encoder_mask = encoder_mask[i:i+1]
+                        beam_out = beam_search_decode_optimized(
+                            model_module, single_encoder_output, single_encoder_mask, tokenizer_tgt, 
+                            config['seq_len'], device, config['beam_size'],
+                            repetition_penalty=config.get('repetition_penalty', 1.0),
+                            unk_penalty=config.get('unk_penalty', 1.0),
+                            length_penalty=config.get('length_penalty', 1.0)
+                        )
                         outputs_beam.append(beam_out)
-                    if config.get('strategy', 'all') in ['topk', 'all']:
-                        topk_out = top_k_sampling_decode(model, encoder_input[i:i+1], encoder_mask[i:i+1], tokenizer_src, tokenizer_tgt, config['seq_len'], device, config['top_k'])
-                        outputs_top_k.append(topk_out)
-                except Exception as e:
-                    print(f"Warning: Decoding failed for sample {i}: {e}")
-                    # Add empty output to maintain alignment
-                    if config.get('strategy', 'all') in ['greedy', 'all']:
-                        outputs_greedy.append(torch.tensor([tokenizer_tgt.token_to_id('[PAD]')], device=device))
-                    if config.get('strategy', 'all') in ['beam', 'all']:
+                    except Exception as e:
+                        print(f"Warning: Beam search failed for sample {i}: {e}")
                         outputs_beam.append(torch.tensor([tokenizer_tgt.token_to_id('[PAD]')], device=device))
-                    if config.get('strategy', 'all') in ['topk', 'all']:
+            
+            if config.get('strategy', 'all') in ['topk', 'all']:
+                for i in range(batch_size):
+                    try:
+                        single_encoder_output = encoder_output[i:i+1]
+                        single_encoder_mask = encoder_mask[i:i+1]
+                        topk_out = top_k_sampling_decode_optimized(
+                            model_module, single_encoder_output, single_encoder_mask, tokenizer_tgt, 
+                            config['seq_len'], device, config['top_k'],
+                            repetition_penalty=config.get('repetition_penalty', 1.0),
+                            unk_penalty=config.get('unk_penalty', 1.0),
+                            temperature=config.get('temperature', 1.0)
+                        )
+                        outputs_top_k.append(topk_out)
+                    except Exception as e:
+                        print(f"Warning: Top-k sampling failed for sample {i}: {e}")
                         outputs_top_k.append(torch.tensor([tokenizer_tgt.token_to_id('[PAD]')], device=device))
 
             tgt_texts = batch['tgt_text']
@@ -454,15 +520,29 @@ def translate(epoch_number: str, sentence: str, config):
 
         # --- DECODING ---
         # Greedy Decode
-        model_out_greedy = greedy_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt, seq_len, device)
+        model_out_greedy = greedy_decode(
+            model, source, source_mask, tokenizer_src, tokenizer_tgt, seq_len, device,
+            repetition_penalty=config.get('repetition_penalty', 1.0),
+            unk_penalty=config.get('unk_penalty', 1.0)
+        )
         output_text_greedy = tokenizer_tgt.decode(model_out_greedy.tolist())
 
         # Beam Search Decode
-        model_out_beam = beam_search_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt, seq_len, device, config['beam_size'])
+        model_out_beam = beam_search_decode(
+            model, source, source_mask, tokenizer_src, tokenizer_tgt, seq_len, device, config['beam_size'],
+            repetition_penalty=config.get('repetition_penalty', 1.0),
+            unk_penalty=config.get('unk_penalty', 1.0),
+            length_penalty=config.get('length_penalty', 1.0)
+        )
         output_text_beam = tokenizer_tgt.decode(model_out_beam.tolist())
 
         # Top-k Sampling
-        model_out_top_k = top_k_sampling_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt, seq_len, device, config['top_k'])
+        model_out_top_k = top_k_sampling_decode(
+            model, source, source_mask, tokenizer_src, tokenizer_tgt, seq_len, device, config['top_k'],
+            repetition_penalty=config.get('repetition_penalty', 1.0),
+            unk_penalty=config.get('unk_penalty', 1.0),
+            temperature=config.get('temperature', 1.0)
+        )
         output_text_top_k = tokenizer_tgt.decode(model_out_top_k.tolist())
 
     # --- PRINT RESULTS ---
@@ -489,6 +569,13 @@ if __name__ == "__main__":
     parser.add_argument("--positional_encoding", type=str, default="rope", choices=["rope", "relative"], help="Positional encoding type")
     parser.add_argument("--num_workers", type=int, default=4, help="Number of data loading workers")
     parser.add_argument("--max_test_samples", type=int, default=None, help="Limit evaluation to first N samples (for quick runs)")
+    parser.add_argument("--beam_size", type=int, default=5, help="Beam size for beam search")
+    parser.add_argument("--top_k", type=int, default=3, help="Top-k for top-k sampling")
+    parser.add_argument("--repetition_penalty", type=float, default=1.1, help="Penalty for repeating tokens")
+    parser.add_argument("--unk_penalty", type=float, default=1.5, help="Penalty for UNK tokens")
+    parser.add_argument("--length_penalty", type=float, default=1.0, help="Length penalty for beam search")
+    parser.add_argument("--temperature", type=float, default=1.0, help="Temperature for top-k sampling")
+    parser.add_argument("--use_batch_greedy", action="store_true", default=True, help="Use optimized batch greedy decoding")
     
     args = parser.parse_args()
     
@@ -499,6 +586,13 @@ if __name__ == "__main__":
     config['positional_encoding'] = args.positional_encoding
     config['num_workers'] = args.num_workers
     config['max_test_samples'] = args.max_test_samples
+    config['beam_size'] = args.beam_size
+    config['top_k'] = args.top_k
+    config['repetition_penalty'] = args.repetition_penalty
+    config['unk_penalty'] = args.unk_penalty
+    config['length_penalty'] = args.length_penalty
+    config['temperature'] = args.temperature
+    config['use_batch_greedy'] = args.use_batch_greedy
     
     if args.evaluate:
         evaluate_model(args.epoch_number, config)
