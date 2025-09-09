@@ -355,19 +355,20 @@ def greedy_decode_optimized(model_module, encoder_output, source_mask, tokenizer
     sos_idx = tokenizer_tgt.token_to_id('[SOS]')
     eos_idx = tokenizer_tgt.token_to_id('[EOS]')
     unk_idx = tokenizer_tgt.token_to_id('[UNK]')
-    
-    decoder_input = torch.empty(1, 1).fill_(sos_idx).type_as(encoder_output).to(device)
-    
+    # decoder input must be integer token indices (long)
+    decoder_input = torch.full((1, 1), sos_idx, dtype=torch.long, device=device)
+
     # Track generated tokens for repetition penalty
     generated_tokens = set()
-    
+
     while True:
         if decoder_input.size(1) == max_len:
             break
+
         decoder_mask = causal_mask(decoder_input.size(1), device=device).type_as(source_mask).to(device)
         decoder_output = model_module.decode(encoder_output, source_mask, decoder_input, decoder_mask)
         logits = model_module.project(decoder_output[:, -1])
-        
+
         # Apply repetition penalty
         if repetition_penalty != 1.0:
             for token_id in generated_tokens:
@@ -375,22 +376,23 @@ def greedy_decode_optimized(model_module, encoder_output, source_mask, tokenizer
                     logits[0, token_id] /= repetition_penalty
                 else:
                     logits[0, token_id] *= repetition_penalty
-        
+
         # Apply UNK penalty
         if unk_penalty != 1.0 and unk_idx is not None:
             if logits[0, unk_idx] > 0:
                 logits[0, unk_idx] /= unk_penalty
             else:
                 logits[0, unk_idx] *= unk_penalty
-        
+
+        # Select next token (greedy)
         _, next_word = torch.max(logits, dim=1)
-        decoder_input = torch.cat([decoder_input, torch.empty(1, 1).type_as(encoder_output).fill_(next_word.item()).to(device)], dim=1)
-        
-        # Track generated tokens
+        decoder_input = torch.cat([decoder_input, torch.tensor([[next_word.item()]], dtype=torch.long, device=device)], dim=1)
+
+        # Track generated tokens and check for EOS
         generated_tokens.add(next_word.item())
-        
         if next_word.item() == eos_idx:
             break
+
     return decoder_input.squeeze(0)
 
 def greedy_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt, max_len, device, repetition_penalty=1.0, unk_penalty=1.0):
@@ -399,7 +401,8 @@ def greedy_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt, max_
     eos_idx = tokenizer_tgt.token_to_id('[EOS]')
     unk_idx = tokenizer_tgt.token_to_id('[UNK]')
     encoder_output = model_module.encode(source, source_mask)
-    decoder_input = torch.empty(1, 1).fill_(sos_idx).type_as(source).to(device)
+    # Ensure decoder input is integer indices (long)
+    decoder_input = torch.full((1, 1), sos_idx, dtype=torch.long, device=device)
     
     # Track generated tokens for repetition penalty
     generated_tokens = set()
@@ -425,13 +428,13 @@ def greedy_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt, max_
                 logits[0, unk_idx] /= unk_penalty
             else:
                 logits[0, unk_idx] *= unk_penalty
-        
+
         _, next_word = torch.max(logits, dim=1)
-        decoder_input = torch.cat([decoder_input, torch.empty(1, 1).type_as(source).fill_(next_word.item()).to(device)], dim=1)
-        
+        decoder_input = torch.cat([decoder_input, torch.tensor([[next_word.item()]], dtype=torch.long, device=device)], dim=1)
+
         # Track generated tokens
         generated_tokens.add(next_word.item())
-        
+
         if next_word.item() == eos_idx:
             break
     return decoder_input.squeeze(0)
@@ -577,9 +580,9 @@ def top_k_sampling_decode_optimized(model_module, encoder_output, source_mask, t
     sos_idx = tokenizer_tgt.token_to_id('[SOS]')
     eos_idx = tokenizer_tgt.token_to_id('[EOS]')
     unk_idx = tokenizer_tgt.token_to_id('[UNK]')
+    # decoder input must be integer token indices (long), not float like encoder output
+    decoder_input = torch.full((1, 1), sos_idx, dtype=torch.long, device=device)
 
-    decoder_input = torch.empty(1, 1).fill_(sos_idx).type_as(encoder_output).to(device)
-    
     # Track generated tokens for repetition penalty
     generated_tokens = set()
 
@@ -589,9 +592,9 @@ def top_k_sampling_decode_optimized(model_module, encoder_output, source_mask, t
 
         decoder_mask = causal_mask(decoder_input.size(1), device=device).type_as(source_mask).to(device)
         decoder_output = model_module.decode(encoder_output, source_mask, decoder_input, decoder_mask)
-        
+
         logits = model_module.project(decoder_output[:, -1])
-        
+
         # Apply repetition penalty
         if repetition_penalty != 1.0:
             for token_id in generated_tokens:
@@ -599,34 +602,34 @@ def top_k_sampling_decode_optimized(model_module, encoder_output, source_mask, t
                     logits[0, token_id] /= repetition_penalty
                 else:
                     logits[0, token_id] *= repetition_penalty
-        
+
         # Apply UNK penalty
         if unk_penalty != 1.0 and unk_idx is not None:
             if logits[0, unk_idx] > 0:
                 logits[0, unk_idx] /= unk_penalty
             else:
                 logits[0, unk_idx] *= unk_penalty
-        
+
         # Apply temperature scaling
         if temperature != 1.0:
             logits = logits / temperature
-        
+
         # Apply top-k sampling
         top_k_probs, top_k_indices = torch.topk(logits, top_k, dim=-1)
-        
-        # Create a new distribution from the top-k probabilities
+
+        # Create a new distribution from the top-k probabilities (use logits)
         dist = torch.distributions.categorical.Categorical(logits=top_k_probs)
         next_token_idx_in_top_k = dist.sample()
         next_word = top_k_indices.gather(-1, next_token_idx_in_top_k.unsqueeze(-1)).squeeze(-1)
 
-        decoder_input = torch.cat([decoder_input, next_word.unsqueeze(0)], dim=1)
-        
-        # Track generated tokens
-        generated_tokens.add(next_word.item())
+        # ensure next_word is long when appended
+        decoder_input = torch.cat([decoder_input, next_word.unsqueeze(0).to(torch.long)], dim=1)
 
+        # Track generated tokens and check for EOS
+        generated_tokens.add(next_word.item())
         if next_word.item() == eos_idx:
             break
-            
+
     return decoder_input.squeeze(0)
 
 def batch_greedy_decode(model_module, encoder_output, source_mask, tokenizer_tgt, max_len, device, repetition_penalty=1.0, unk_penalty=1.0):
@@ -692,7 +695,8 @@ def top_k_sampling_decode(model, source, source_mask, tokenizer_src, tokenizer_t
     unk_idx = tokenizer_tgt.token_to_id('[UNK]')
 
     encoder_output = model_module.encode(source, source_mask)
-    decoder_input = torch.empty(1, 1).fill_(sos_idx).type_as(source).to(device)
+    # decoder input must be integer token indices (long), not float like source
+    decoder_input = torch.full((1, 1), sos_idx, dtype=torch.long, device=device)
     
     # Track generated tokens for repetition penalty
     generated_tokens = set()
@@ -733,8 +737,9 @@ def top_k_sampling_decode(model, source, source_mask, tokenizer_src, tokenizer_t
         next_token_idx_in_top_k = dist.sample()
         next_word = top_k_indices.gather(-1, next_token_idx_in_top_k.unsqueeze(-1)).squeeze(-1)
 
-        decoder_input = torch.cat([decoder_input, next_word.unsqueeze(0)], dim=1)
-        
+        # ensure next_word is long when appended
+        decoder_input = torch.cat([decoder_input, next_word.unsqueeze(0).to(torch.long)], dim=1)
+
         # Track generated tokens
         generated_tokens.add(next_word.item())
 
